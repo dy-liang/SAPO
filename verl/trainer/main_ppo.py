@@ -16,7 +16,7 @@ Note that we don't combine the main with ray_trainer as ray_trainer is used by o
 """
 
 import os
-
+#os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 import hydra
 import ray
 from omegaconf import OmegaConf

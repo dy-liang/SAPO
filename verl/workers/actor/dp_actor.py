@@ -26,6 +26,7 @@ from typing import Tuple
 import torch
 from torch import nn
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+#torch.set_printoptions(threshold=float("inf"))
 
 import verl.utils.torch_functional as verl_F
 from verl import DataProto
@@ -38,7 +39,7 @@ from verl.utils.seqlen_balancing import get_reverse_idx, rearrange_micro_batches
 from verl.utils.torch_functional import logprobs_from_logits
 from verl.utils.ulysses import gather_outpus_and_unpad, ulysses_pad_and_slice_inputs, ulysses_pad
 from verl.workers.actor import BasePPOActor
-
+from transformers import PreTrainedTokenizer
 if is_cuda_available:
     from flash_attn.bert_padding import index_first_axis, pad_input, rearrange, unpad_input
 elif is_npu_available:
@@ -50,6 +51,36 @@ __all__ = ["DataParallelPPOActor"]
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
+def create_action_mask(batch):
+    """
+    generate mask within tag <action></action>。
+    Args:
+        input_ids: (batch_size, seq_len)
+    Returns:
+        action_mask: (batch_size, seq_len) tokens in tag using 1, otherwise 0
+    """
+    response_ids = batch['responses']
+    B, L = response_ids.shape
+    device = response_ids.device
+
+    is_start_marker = (response_ids[:, :-2] == 27) & (response_ids[:, 1:-1] == 1311) #& (response_ids[:, 2:] == 29)
+    start_pos = torch.zeros((B, L), device=device, dtype=torch.bool)
+    start_pos[:, 2:] = is_start_marker
+
+    is_end_marker = (response_ids[:, :-2] == 522) & (response_ids[:, 1:-1] == 1311) #& (response_ids[:, 2:] == 397)
+    end_pos = torch.zeros((B, L), device=device, dtype=torch.bool)
+    end_pos[:, :-2] = is_end_marker
+    #print("marker:",is_start_marker[0],is_end_marker[0])
+
+    in_action_zone = torch.cumsum(start_pos.long(), dim=-1) - torch.cumsum(end_pos.long(), dim=-1)
+
+    action_mask = (in_action_zone > 0).float()
+
+    # ex '>' token：
+    action_mask = action_mask * (~start_pos)
+    #print("mask:",action_mask[0] * response_ids[0])
+
+    return action_mask
 
 class DataParallelPPOActor(BasePPOActor):
     def __init__(self, config, actor_module: nn.Module, actor_optimizer: torch.optim.Optimizer = None):
@@ -57,11 +88,15 @@ class DataParallelPPOActor(BasePPOActor):
         super().__init__(config)
         self.actor_module = actor_module
         self.actor_optimizer = actor_optimizer
-
         self.use_remove_padding = self.config.get("use_remove_padding", False)
         print(f"Actor use_remove_padding={self.use_remove_padding}")
         self.use_fused_kernels = self.config.get("use_fused_kernels", False)
         print(f"Actor use_fused_kernels={self.use_fused_kernels}")
+
+        self.novelty_coef = self.config.get("novelty_coef", 0.001)
+        print(f"Novelty_coef={self.novelty_coef}")
+        self.novelty_max = self.config.get("novelty_max", 0.1)
+        print(f"Novelty_max={self.novelty_max}")
 
         self.ulysses_sequence_parallel_size = self.config.ulysses_sequence_parallel_size
         self.use_ulysses_sp = self.ulysses_sequence_parallel_size > 1
@@ -73,7 +108,7 @@ class DataParallelPPOActor(BasePPOActor):
         )
         self.device_name = get_device_name()
 
-    def _forward_micro_batch(self, micro_batch, temperature, calculate_entropy=False) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _forward_micro_batch(self, micro_batch, temperature, calculate_entropy=False, calculate_nov=False) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Returns:
             entropy: # (bs, response_len)
@@ -138,7 +173,7 @@ class DataParallelPPOActor(BasePPOActor):
                     extra_args["return_dict"] = True
 
                 output = self.actor_module(
-                    input_ids=input_ids_rmpad,
+                    input_ids=input_ids_rmpad, # prompt+response
                     attention_mask=None,
                     position_ids=position_ids_rmpad,
                     **multi_modal_inputs,
@@ -197,11 +232,42 @@ class DataParallelPPOActor(BasePPOActor):
                     batch=batch_size,
                     seqlen=seqlen,
                 )
+                full_logits = pad_input(
+                    hidden_states=logits_rmpad,
+                    indices=indices,
+                    batch=batch_size,
+                    seqlen=seqlen,
+                )
 
                 # only return response part:
                 if calculate_entropy:
                     entropy = full_entropy.squeeze(-1)[:, -response_length - 1 : -1]  # (bsz, response_length)
-                log_probs = full_log_probs.squeeze(-1)[:, -response_length - 1 : -1]  # (bsz, response_length)
+                log_probs = full_log_probs.squeeze(-1)[:, -response_length - 1 : -1]  # (bsz, response_length) align
+                #response_logits = full_logits[:, -response_length - 1 : -1, :]  # (bsz, response_length, vocab_size)
+                #response_ids = input_ids[:, -response_length - 1: -1]  # (bsz, response_length)
+                #response_logit = torch.gather(
+                #     response_logits,           # (bsz, response_length, vocab)
+                #     dim=2,
+                #     index=response_ids.unsqueeze(-1)  # (bsz, response_length, 1)
+                # ).squeeze(-1)                  # (bsz, response_length)
+                #response_certainty = torch.logsumexp(response_logits, dim=-1) - response_logits.mean(dim=-1) #(bsz, response_length)
+                #response_mask = attention_mask[:, -response_length:]
+                action_novelty = None
+                if calculate_nov:
+                    action_mask = create_action_mask(batch=micro_batch) # (bsz, response_length)
+                    action_probs_sum = (action_mask * log_probs).sum(dim=-1) # (bsz, response_length)
+                    #action_probs_sum = (action_mask * response_logit).sum(dim=-1) # (bsz, response_length)
+                    #action_probs_sum = (action_mask * response_certainty).sum(dim=-1) # (bsz, response_length)
+                    #action_probs_sum = (response_mask * response_certainty).sum(dim=-1) # (bsz, response_length)
+
+                    #token_count = response_mask.sum(dim=-1) # (bsz, response_length)
+                    token_count = action_mask.sum(dim=-1) # (bsz, response_length)
+
+                    action_probs_mean = action_probs_sum / token_count.clamp(min=1e-6)
+                    action_probs_mean = action_probs_mean.masked_fill(token_count == 0, 0.0)
+                    # action_novelty = (action_probs_mean * self.novelty_coef).clamp(min=-self.novelty_max, max=self.novelty_max) # 0.001 0.05
+                    action_novelty = action_probs_mean.unsqueeze(-1).detach()
+                    #print(action_novelty)
 
             else:  # not using rmpad and no ulysses sp
                 extra_args = {}
@@ -229,7 +295,7 @@ class DataParallelPPOActor(BasePPOActor):
                     if calculate_entropy:
                         entropy = verl_F.entropy_from_logits(logits)  # (bsz, response_length)
 
-            return entropy, log_probs
+            return entropy, log_probs, action_novelty
 
     def _optimizer_step(self):
         assert self.config.grad_clip is not None
@@ -250,7 +316,7 @@ class DataParallelPPOActor(BasePPOActor):
         return grad_norm
 
     @GPUMemoryLogger(role="dp actor", logger=logger)
-    def compute_log_prob(self, data: DataProto, calculate_entropy=False) -> torch.Tensor:
+    def compute_log_prob(self, data: DataProto, calculate_entropy=False, calculate_nov=False) -> torch.Tensor:
         """Compute the log probability of the responses given input_ids, attention_mask and position_ids
 
         Args:
@@ -292,26 +358,32 @@ class DataParallelPPOActor(BasePPOActor):
 
         log_probs_lst = []
         entropy_lst = []
+        action_novelty_lst = []
         for micro_batch in micro_batches:
             if isinstance(micro_batch, DataProto):
                 micro_batch = {**micro_batch.batch, **micro_batch.non_tensor_batch}
             with torch.no_grad():
-                entropy, log_probs = self._forward_micro_batch(micro_batch, temperature=temperature, calculate_entropy=calculate_entropy)
+                entropy, log_probs, action_novelty = self._forward_micro_batch(micro_batch, temperature=temperature, calculate_entropy=calculate_entropy, calculate_nov=calculate_nov)
             log_probs_lst.append(log_probs)
             if calculate_entropy:
                 entropy_lst.append(entropy)
+            if calculate_nov:
+                action_novelty_lst.append(action_novelty)
 
         log_probs = torch.concat(log_probs_lst, dim=0)
         entropys = None
         if calculate_entropy:
             entropys = torch.concat(entropy_lst, dim=0)
+        action_novelties = None
+        if calculate_nov:
+            action_novelties = torch.concat(action_novelty_lst, dim=0)
         if use_dynamic_bsz:
             indices = list(itertools.chain.from_iterable(indices))
             assert len(indices) == log_probs.size(0), f"{len(indices)} vs. {log_probs.size()}"
             revert_indices = torch.tensor(get_reverse_idx(indices), dtype=torch.long)
             log_probs = log_probs[revert_indices]
 
-        return log_probs, entropys
+        return log_probs, entropys, action_novelties
 
     @GPUMemoryLogger(role="dp actor", logger=logger)
     def update_policy(self, data: DataProto):
@@ -385,7 +457,7 @@ class DataParallelPPOActor(BasePPOActor):
                     calculate_entropy = False
                     if entropy_coeff != 0:
                         calculate_entropy = True
-                    entropy, log_prob = self._forward_micro_batch(micro_batch=data, temperature=temperature, calculate_entropy=calculate_entropy)
+                    entropy, log_prob, _ = self._forward_micro_batch(micro_batch=data, temperature=temperature, calculate_entropy=calculate_entropy, calculate_nov=False)
                     
                     loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
                     if loss_mode == "vanilla":

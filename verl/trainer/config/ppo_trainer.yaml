@@ -26,6 +26,10 @@ data:
 
 actor_rollout_ref:
   hybrid_engine: True
+  novelty_module:
+    enable: False
+    novelty_coef: 0.001
+    novelty_max: 0.1
   model:
     path: ~/models/deepseek-llm-7b-chat
     use_shm: False
@@ -230,6 +234,8 @@ reward_model:
 custom_reward_function:
   path: null
   name: compute_score
+
+
 
 algorithm:
   gamma: 1.0

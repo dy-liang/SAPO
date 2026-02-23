@@ -26,7 +26,7 @@ class EpisodeRewardManager:
         self.num_examine = num_examine  # the number of batches of decoded responses to print to the console
         self.normalize_by_length = normalize_by_length
 
-    def __call__(self, data: DataProto, return_dict=False):
+    def __call__(self, data: DataProto, step_credits, return_dict=False):
         """We will expand this function gradually based on the available datasets"""
 
         # If there is rm score, we directly return rm score. Otherwise, we compute via rm_score_fn
@@ -37,6 +37,7 @@ class EpisodeRewardManager:
                 return data.batch["rm_scores"]
 
         reward_tensor = torch.zeros_like(data.batch['responses'], dtype=torch.float32)
+        step_rewards = data.non_tensor_batch['rewards']
 
         already_print_data_sources = {}
 
@@ -68,8 +69,30 @@ class EpisodeRewardManager:
                 pixel_values = multi_modal_inputs['pixel_values']
                 image_grid_thw = multi_modal_inputs['image_grid_thw']
 
+            if step_credits!=None:
+                if data_item.non_tensor_batch['episode_rewards'] > 5.0:
+                    step_rewards[i] = step_rewards[i] * step_credits[i].item() # for gigpo return, tuple
 
-            episode_rewards = data_item.non_tensor_batch['episode_rewards']
+                    episode_rewards = data_item.non_tensor_batch['episode_rewards'] * step_credits[i] # multiple credit value
+                
+                elif data_item.non_tensor_batch['episode_rewards'] == 0.0:
+                    step_rewards[i] = step_credits[i].item() * 1.0
+                    #episode_rewards = (step_credits[i] * (1.0)) - (0.02 if step_credits[i]>0.0 else 0.0) # mask v1: mask suffix steps
+                    #episode_rewards = (step_credits[i] * (1.0)) if step_credits[i]>0.0 else 0.0 # mask v2: mask suffix steps
+                    episode_rewards = step_credits[i] * 1.0 # positive all 1.0
+                    #episode_rewards = step_credits[i] * 5.0 - 0.2 # positive all - bias
+                else:
+                    episode_rewards = data_item.non_tensor_batch['episode_rewards']
+
+                # if data_item.non_tensor_batch['episode_rewards'] > 5.0:
+                #     episode_rewards = data_item.non_tensor_batch['episode_rewards'] * step_credits[i] # multiple credit value
+                # else:
+                #     episode_rewards = data_item.non_tensor_batch['episode_rewards']
+
+                #episode_rewards = data_item.non_tensor_batch['episode_rewards'] + step_credits[i]
+            else:
+                episode_rewards = data_item.non_tensor_batch['episode_rewards']
+
             episode_lengths = data_item.non_tensor_batch['episode_lengths']
 
             if self.normalize_by_length:
@@ -90,7 +113,8 @@ class EpisodeRewardManager:
         if return_dict:
             return {
                 "reward_tensor": reward_tensor,
-                "reward_extra_info": {},
+                "step_rewards": step_rewards,
+                "reward_extra_info": {}
             }
         else:
             return reward_tensor

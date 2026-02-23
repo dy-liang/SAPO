@@ -1,15 +1,20 @@
 set -x
 ENGINE=${1:-vllm}
 export VLLM_ATTENTION_BACKEND=XFORMERS
+export CUDA_VISIBLE_DEVICES=2 #ps -ef | grep "+logits_swtich" | grep -v grep
 
 num_cpus_per_env_worker=0.1 # The CPU resource allocated for each environment worker. If you want to use less CPU resources, you can decrease this value.
 
 train_data_size=16
-val_data_size=128
+val_data_size=48
 group_size=8
-mode="mean_std_norm" # "mean_norm" or "mean_std_norm"
+mode="mean_std_norm" # "mean_norm" or "mean_std_norm" bash examples/gigpo_trainer/run_alfworld.sh
 
-# We only use data preparation to indicate the modality and the data size.
+# nohup bash examples/gigpo_trainer/run_alfworld.sh > ./test_s0_0_0.0001_0.05_T-alllogits_noNorm.log 2>&1 &
+# nohup bash examples/gigpo_trainer/run_alfworld.sh > ./test_s0_2_0.001_0.05_nodet_neg_v2.log 2>&1 &
+# nohup bash examples/gigpo_trainer/run_alfworld.sh > ./test_s0_1_0.001_0.05_nodet.log 2>&1 &
+# nohup bash examples/gigpo_trainer/run_alfworld.sh > ./test_s0_0_v1_seed0.log 2>&1 & nohup bash examples/gigpo_trainer/run_alfworld.sh > ./test_gigpo_200_s1_credit_all_pos1.log 2>&1 &
+
 python3 -m examples.data_preprocess.prepare \
     --mode 'text' \
     --train_data_size $train_data_size \
@@ -38,9 +43,9 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.fsdp_config.param_offload=False \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=False \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=32 \
-    actor_rollout_ref.rollout.tensor_model_parallel_size=2 \
+    actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
     actor_rollout_ref.rollout.name=$ENGINE \
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.6 \
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.8 \
     actor_rollout_ref.rollout.enable_chunked_prefill=False \
     actor_rollout_ref.rollout.enforce_eager=False \
     actor_rollout_ref.rollout.free_cache_engine=False \
@@ -50,22 +55,28 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
     actor_rollout_ref.actor.use_invalid_action_penalty=True \
     actor_rollout_ref.actor.invalid_action_penalty_coef=0.1 \
+    actor_rollout_ref.novelty_module.enable=True \
+    actor_rollout_ref.novelty_module.novelty_coef=0.0001 \
+    actor_rollout_ref.novelty_module.novelty_max=0.05 \
     algorithm.use_kl_in_reward=False \
     algorithm.gamma=0.95 \
     algorithm.gigpo.step_advantage_w=1.0 \
     algorithm.gigpo.mode=$mode \
     env.env_name=alfworld/AlfredTWEnv \
-    env.seed=0 \
+    env.seed=1 \
     env.max_steps=50 \
     env.rollout.n=$group_size \
     env.resources_per_worker.num_cpus=$num_cpus_per_env_worker \
     trainer.critic_warmup=0 \
-    trainer.logger=['console','wandb'] \
+    trainer.logger=['console','tensorboard'] \
     trainer.project_name='verl_agent_alfworld' \
-    trainer.experiment_name='gigpo_qwen2.5_1.5b' \
-    trainer.n_gpus_per_node=2 \
+    trainer.experiment_name='gigpo_qwen2.5_1.5b_seed1_200_credit_pos1' \
+    trainer.n_gpus_per_node=1 \
     trainer.nnodes=1 \
     trainer.save_freq=-1 \
     trainer.test_freq=5 \
-    trainer.total_epochs=150 \
+    trainer.total_epochs=200 \
     trainer.val_before_train=True $@
+
+# bash ./gpu.sh
+# echo "GPU holds"

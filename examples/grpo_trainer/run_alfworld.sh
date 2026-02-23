@@ -1,14 +1,15 @@
 set -x
 ENGINE=${1:-vllm}
 export VLLM_ATTENTION_BACKEND=XFORMERS
-
+export CUDA_VISIBLE_DEVICES=2 #ps -ef | grep "+logits_swtich" | grep -v grep
+export HYDRA_FULL_ERROR=1
 num_cpus_per_env_worker=0.1 # The CPU resource allocated for each environment worker. If you want to use less CPU resources, you can decrease this value.
 
 train_data_size=16
-val_data_size=128
+val_data_size=48
 group_size=8
 
-# We only use data preparation to indicate the modality and the data size.
+# We only use data preparation to indicate the modality and the data size. pkill -f "_mask"
 python3 -m examples.data_preprocess.prepare \
     --mode 'text' \
     --train_data_size $train_data_size \
@@ -37,9 +38,9 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.fsdp_config.param_offload=False \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=False \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=32 \
-    actor_rollout_ref.rollout.tensor_model_parallel_size=2 \
+    actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
     actor_rollout_ref.rollout.name=$ENGINE \
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.6 \
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.8 \
     actor_rollout_ref.rollout.enable_chunked_prefill=False \
     actor_rollout_ref.rollout.enforce_eager=False \
     actor_rollout_ref.rollout.free_cache_engine=False \
@@ -49,6 +50,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
     actor_rollout_ref.actor.use_invalid_action_penalty=True \
     actor_rollout_ref.actor.invalid_action_penalty_coef=0.1 \
+    actor_rollout_ref.novelty_module.enable=True \
     algorithm.use_kl_in_reward=False \
     env.env_name=alfworld/AlfredTWEnv \
     env.seed=0 \
@@ -56,12 +58,14 @@ python3 -m verl.trainer.main_ppo \
     env.rollout.n=$group_size \
     env.resources_per_worker.num_cpus=$num_cpus_per_env_worker \
     trainer.critic_warmup=0 \
-    trainer.logger=['console','wandb'] \
+    trainer.logger=['console','tensorboard'] \
     trainer.project_name='verl_agent_alfworld' \
-    trainer.experiment_name='grpo_qwen2.5_1.5b' \
-    trainer.n_gpus_per_node=2 \
+    trainer.experiment_name='grpo_200_qwen2.5_1.5b_s0_1_pos05T' \
+    trainer.n_gpus_per_node=1 \
     trainer.nnodes=1 \
     trainer.save_freq=-1 \
     trainer.test_freq=5 \
-    trainer.total_epochs=150 \
+    trainer.total_epochs=200 \
     trainer.val_before_train=True $@
+
+#sh /home/hly/projects/llm-agent/verl-agent/gpu.sh  grpo_200_qwen2.5_1.5b_s0_2_credit_v2_pos5-0.2

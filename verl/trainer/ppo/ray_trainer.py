@@ -763,7 +763,7 @@ class RayPPOTrainer:
             # test_batch = test_batch.union(test_output_gen_batch)
 
             # evaluate using reward_function
-            result = self.val_reward_fn(test_batch, return_dict=True)
+            result = self.val_reward_fn(test_batch, step_credits=None, return_dict=True)
             reward_tensor = result["reward_tensor"]
             scores = reward_tensor.sum(-1).cpu().tolist()
             sample_scores.extend(scores)
@@ -1043,6 +1043,7 @@ class RayPPOTrainer:
         # we start from step 1
         self.global_steps += 1
         last_val_metrics = None
+        novelty_enable = self.config.actor_rollout_ref.novelty_module.enable
 
         for epoch in range(self.config.trainer.total_epochs):
             for batch_dict in self.train_dataloader:
@@ -1108,14 +1109,7 @@ class RayPPOTrainer:
                     del batch
                     batch = gen_batch_output
 
-                    if self.config.algorithm.adv_estimator == AdvantageEstimator.GiGPO:
-                        step_rewards_tensor = core_gigpo.compute_step_discounted_returns(
-                            batch=batch,
-                            gamma=self.config.algorithm.gamma
-                        )
-                        batch.batch['step_rewards'] = step_rewards_tensor
-                    
-                    batch = adjust_batch(self.config, batch)
+                    #batch = adjust_batch(self.config, batch)
 
                     batch.batch["response_mask"] = compute_response_mask(batch)
                     # balance the number of valid tokens on each dp rank.
@@ -1127,25 +1121,31 @@ class RayPPOTrainer:
                     # compute global_valid tokens
                     batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
 
-                    with _timer("reward", timing_raw):
-                        # compute reward model score
-                        if self.use_rm:
-                            reward_tensor = self.rm_wg.compute_rm_score(batch)
-                            batch = batch.union(reward_tensor)
-
-                        if self.config.reward_model.launch_reward_fn_async:
-                            future_reward = compute_reward_async.remote(batch, self.config, self.tokenizer)
-                        else:
-                            reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn)
 
                     # recompute old_log_probs
                     with _timer("old_log_prob", timing_raw):
                         old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
                         entropys = old_log_prob.batch["entropys"]
                         response_masks = batch.batch["response_mask"]
+
+                        #action_novelty = action_novelty - action_novelty.mean() # (bzs,1)
                         loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
                         entropy_loss = agg_loss(loss_mat=entropys, loss_mask=response_masks, loss_agg_mode=loss_agg_mode)
                         old_log_prob_metrics = {"actor/entropy_loss": entropy_loss.detach().item()}
+                        if novelty_enable: 
+                            action_novelty = old_log_prob.batch["action_novelty"]
+                            step_credits = core_gigpo.compute_step_credits(batch, action_novelty)
+                            metrics.update(
+                                {
+                                        "training/action_novelty_mean": step_credits.detach().mean().item(),
+                                        "training/action_novelty_max": step_credits.detach().max().item(),
+                                        "training/action_novelty_min": step_credits.detach().min().item(),
+                                        # "training/index_lst_mean": index_lst.mean().item(),
+                                        # "training/index_lst_max": index_lst.max().item(),
+                                        # "training/index_lst_min": index_lst.min().item(),
+
+                                }
+                            )
                         metrics.update(old_log_prob_metrics)
                         old_log_prob.batch.pop("entropys")
                         batch = batch.union(old_log_prob)
@@ -1174,6 +1174,31 @@ class RayPPOTrainer:
                                 }
                             )
 
+                    with _timer("reward", timing_raw):
+                        # compute reward model score
+                        if self.use_rm:
+                            reward_tensor = self.rm_wg.compute_rm_score(batch)
+                            batch = batch.union(reward_tensor)
+
+                        if self.config.reward_model.launch_reward_fn_async:
+                            future_reward = compute_reward_async.remote(batch, self.config, self.tokenizer)
+                        else:
+                            if not novelty_enable: 
+                                step_credits = None
+                            reward_tensor, step_rewards, reward_extra_infos_dict = compute_reward(batch, step_credits, self.reward_fn)
+                            batch.non_tensor_batch['rewards'] = step_rewards # for gigpo returns
+                            batch.batch["token_level_scores"] = reward_tensor
+
+
+                    if self.config.algorithm.adv_estimator == AdvantageEstimator.GiGPO: # TODO:Address adjusted batch issue
+                        step_rewards_tensor = core_gigpo.compute_step_discounted_returns(
+                            batch=batch,
+                            gamma=self.config.algorithm.gamma
+                        )
+                        batch.batch['step_rewards'] = step_rewards_tensor
+
+                    batch = adjust_batch(self.config, batch)
+
                     if self.use_reference_policy:
                         # compute reference log_prob
                         with _timer("ref", timing_raw):
@@ -1194,7 +1219,7 @@ class RayPPOTrainer:
                         reward_extra_infos_dict: dict[str, list]
                         if self.config.reward_model.launch_reward_fn_async:
                             reward_tensor, reward_extra_infos_dict = ray.get(future_reward)
-                        batch.batch["token_level_scores"] = reward_tensor
+                        #batch.batch["token_level_scores"] = reward_tensor
 
                         print(f"{list(reward_extra_infos_dict.keys())=}")
                         if reward_extra_infos_dict:
