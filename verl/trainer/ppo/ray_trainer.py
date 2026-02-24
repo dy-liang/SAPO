@@ -1187,15 +1187,16 @@ class RayPPOTrainer:
                                 step_credits = None
                             reward_tensor, step_rewards, reward_extra_infos_dict = compute_reward(batch, step_credits, self.reward_fn)
                             batch.non_tensor_batch['rewards'] = step_rewards # for gigpo returns
-                            batch.batch["token_level_scores"] = reward_tensor
-
+                            batch.batch["token_level_scores"] = reward_tensor # for grpo
+                            #print("step rew:",batch.non_tensor_batch['rewards'])
+                            #print("token rew:",batch.batch["token_level_scores"].sum(-1))
 
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.GiGPO: # TODO:Address adjusted batch issue
                         step_rewards_tensor = core_gigpo.compute_step_discounted_returns(
                             batch=batch,
                             gamma=self.config.algorithm.gamma
                         )
-                        batch.batch['step_rewards'] = step_rewards_tensor
+                        batch.batch['step_rewards'] = step_rewards_tensor # note: step_rewards does not act outcome broadcasting.
 
                     batch = adjust_batch(self.config, batch)
 
@@ -1238,7 +1239,7 @@ class RayPPOTrainer:
                             metrics.update(kl_metrics)
                         else:
                             batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
-
+                        #batch.batch['step_rewards'] = batch.batch["token_level_rewards"].sum(-1)
                         # compute advantages, executed on the driver process
 
                         norm_adv_by_std_in_grpo = self.config.algorithm.get("norm_adv_by_std_in_grpo", True)  # GRPO adv normalization factor

@@ -71,12 +71,13 @@ class EpisodeRewardManager:
 
             if step_credits!=None:
                 if data_item.non_tensor_batch['episode_rewards'] > 5.0:
-                    step_rewards[i] = step_rewards[i] * step_credits[i].item() # for gigpo return, tuple
+                    #step_rewards[i] = step_rewards[i] * step_credits[i].item() # for gigpo return, tuple
+                    #step_rewards[i] = data_item.non_tensor_batch['episode_rewards'].item() * step_credits[i].item() # non
 
                     episode_rewards = data_item.non_tensor_batch['episode_rewards'] * step_credits[i] # multiple credit value
                 
                 elif data_item.non_tensor_batch['episode_rewards'] == 0.0:
-                    step_rewards[i] = step_credits[i].item() * 1.0
+                    #step_rewards[i] = step_credits[i].item() * 2.0
                     #episode_rewards = (step_credits[i] * (1.0)) - (0.02 if step_credits[i]>0.0 else 0.0) # mask v1: mask suffix steps
                     #episode_rewards = (step_credits[i] * (1.0)) if step_credits[i]>0.0 else 0.0 # mask v2: mask suffix steps
                     episode_rewards = step_credits[i] * 1.0 # positive all 1.0
