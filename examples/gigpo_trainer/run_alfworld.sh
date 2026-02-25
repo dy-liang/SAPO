@@ -60,7 +60,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.novelty_module.novelty_max=0.05 \
     algorithm.use_kl_in_reward=False \
     algorithm.gamma=0.95 \
-    algorithm.gigpo.step_advantage_w=0.05 \
+    algorithm.gigpo.step_advantage_w=1.0 \
     algorithm.gigpo.mode=$mode \
     env.env_name=alfworld/AlfredTWEnv \
     env.seed=1 \
@@ -70,7 +70,7 @@ python3 -m verl.trainer.main_ppo \
     trainer.critic_warmup=0 \
     trainer.logger=['console','tensorboard'] \
     trainer.project_name='verl_agent_alfworld' \
-    trainer.experiment_name='gigpo_qwen2.5_1.5b_seed1_200_credit_pos1_w005' \
+    trainer.experiment_name='gigpo_qwen2.5_1.5b_seed1_200_credit_pos1' \
     trainer.n_gpus_per_node=1 \
     trainer.nnodes=1 \
     trainer.save_freq=-1 \

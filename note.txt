@@ -1,0 +1,5 @@
+下一步需要验证的实验
+
+1. 改变gigpo优势权重为0.3，0.5：test_gigpo_200_s1_credit_pos1_w03
+2. grpo-pos05 seed=1实验：test_grpo_200_s1_1_credit_v2_pos05 + test_grpo_200_s1_2_credit_v2_pos05
+3. point 代码+实验

@@ -264,7 +264,7 @@ class DataParallelPPOActor(BasePPOActor):
                     token_count = action_mask.sum(dim=-1) # (bsz, response_length)
 
                     action_probs_mean = action_probs_sum / token_count.clamp(min=1e-6)
-                    action_probs_mean = action_probs_mean.masked_fill(token_count == 0, 0.0)
+                    action_probs_mean = action_probs_mean.masked_fill(token_count != 100, 0.0) # 0.0 -> reward hacking
                     # action_novelty = (action_probs_mean * self.novelty_coef).clamp(min=-self.novelty_max, max=self.novelty_max) # 0.001 0.05
                     action_novelty = action_probs_mean.unsqueeze(-1).detach()
                     #print(action_novelty)

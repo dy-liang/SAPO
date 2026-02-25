@@ -1,7 +1,7 @@
 set -x
 ENGINE=${1:-vllm}
 export VLLM_ATTENTION_BACKEND=XFORMERS
-export CUDA_VISIBLE_DEVICES=1 #ps -ef | grep "+logits_swtich" | grep -v grep
+export CUDA_VISIBLE_DEVICES=3 #ps -ef | grep "+logits_swtich" | grep -v grep
 export HYDRA_FULL_ERROR=1
 num_cpus_per_env_worker=0.1 # The CPU resource allocated for each environment worker. If you want to use less CPU resources, you can decrease this value.
 
@@ -53,14 +53,14 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.novelty_module.enable=True \
     algorithm.use_kl_in_reward=False \
     env.env_name=alfworld/AlfredTWEnv \
-    env.seed=0 \
+    env.seed=1 \
     env.max_steps=50 \
     env.rollout.n=$group_size \
     env.resources_per_worker.num_cpus=$num_cpus_per_env_worker \
     trainer.critic_warmup=0 \
     trainer.logger=['console','tensorboard'] \
     trainer.project_name='verl_agent_alfworld' \
-    trainer.experiment_name='grpo_200_qwen2.5_1.5b_s0_2_pos05T' \
+    trainer.experiment_name='grpo_200_qwen2.5_1.5b_s1_1_pos1_all0' \
     trainer.n_gpus_per_node=1 \
     trainer.nnodes=1 \
     trainer.save_freq=-1 \

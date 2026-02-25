@@ -97,6 +97,7 @@ def compute_step_credits(batch, action_novelty):
     active_masks = batch.non_tensor_batch['active_masks'].astype(np.float32)
     softmax_by_traj = {}
     unique_traj_uids = np.unique(traj_uids)
+    lst = []
     for uid in unique_traj_uids:
         # Get indices for this trajectory
         traj_indices = np.where(traj_uids == uid)[0]
@@ -107,7 +108,14 @@ def compute_step_credits(batch, action_novelty):
         assert traj_active_masks.all(), "active_masks should be all 1s for the same trajectory"
         sf = (traj_action_novelty.softmax(0)) * 1.0
         softmax_by_traj[uid] = sf
-    
+
+    #     is_all_zero = torch.all(torch.abs(traj_action_novelty) < 1e-8).item()
+    #     lst.append(1.0 if is_all_zero else 0.0)
+    # ratios = sum(lst)/len(lst)
+    # print("[TEST: last action token probs]:", traj_action_novelty)
+    # print("[TEST: lastaction token probs softmax]:", sf)
+    # print("[TEST: non ratios]:", ratios, len(lst))
+
     # Recombine the returns into the original batch order
     all_probs_by_traj = torch.zeros_like(action_novelty,device=action_novelty.device)
 
