@@ -1,12 +1,12 @@
 set -x
 ENGINE=${1:-vllm}
 export VLLM_ATTENTION_BACKEND=XFORMERS
-export CUDA_VISIBLE_DEVICES=2 #ps -ef | grep "+logits_swtich" | grep -v grep
+export CUDA_VISIBLE_DEVICES=0 #ps -ef | grep "+logits_swtich" | grep -v grep
 
-num_cpus_per_env_worker=0.1 # The CPU resource allocated for each environment worker. If you want to use less CPU resources, you can decrease this value.
+num_cpus_per_env_worker=0.05 # The CPU resource allocated for each environment worker. If you want to use less CPU resources, you can decrease this value.
 
 train_data_size=16
-val_data_size=48
+val_data_size=128
 group_size=8
 mode="mean_std_norm" # "mean_norm" or "mean_std_norm" bash examples/gigpo_trainer/run_alfworld.sh
 
@@ -55,7 +55,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
     actor_rollout_ref.actor.use_invalid_action_penalty=True \
     actor_rollout_ref.actor.invalid_action_penalty_coef=0.1 \
-    actor_rollout_ref.novelty_module.enable=True \
+    actor_rollout_ref.novelty_module.enable=False \
     actor_rollout_ref.novelty_module.novelty_coef=0.0001 \
     actor_rollout_ref.novelty_module.novelty_max=0.05 \
     algorithm.use_kl_in_reward=False \
@@ -63,14 +63,14 @@ python3 -m verl.trainer.main_ppo \
     algorithm.gigpo.step_advantage_w=1.0 \
     algorithm.gigpo.mode=$mode \
     env.env_name=alfworld/AlfredTWEnv \
-    env.seed=1 \
+    env.seed=3 \
     env.max_steps=50 \
     env.rollout.n=$group_size \
     env.resources_per_worker.num_cpus=$num_cpus_per_env_worker \
     trainer.critic_warmup=0 \
-    trainer.logger=['console','tensorboard'] \
+    trainer.logger=['console','wandb'] \
     trainer.project_name='verl_agent_alfworld' \
-    trainer.experiment_name='gigpo_qwen2.5_1.5b_seed1_200_credit_pos1' \
+    trainer.experiment_name='gigpo_qwen2.5_1.5b_128_200_s3_1_origin' \
     trainer.n_gpus_per_node=1 \
     trainer.nnodes=1 \
     trainer.save_freq=-1 \

@@ -84,50 +84,6 @@ def are_similar(a: str, b: str, threshold: float = 0.95) -> bool:
         raise ValueError("Only text-based observations are supported for similarity-based GiGPO in this version.")
     return SequenceMatcher(None, a, b).ratio() >= threshold
 
-def compute_step_credits(batch, action_novelty):
-    """    
-    Args:
-        batch (DataProto): Input batch.
-    
-    step_credit:
-        torch.Tensor: (Bsz, ).
-    """
-    action_novelty = action_novelty.squeeze(-1) #(N,)
-    traj_uids = batch.non_tensor_batch['traj_uid']
-    active_masks = batch.non_tensor_batch['active_masks'].astype(np.float32)
-    softmax_by_traj = {}
-    unique_traj_uids = np.unique(traj_uids)
-    lst = []
-    for uid in unique_traj_uids:
-        # Get indices for this trajectory
-        traj_indices = np.where(traj_uids == uid)[0]
-        
-        # Extract rewards and masks for this trajectory
-        traj_action_novelty = action_novelty[traj_indices]
-        traj_active_masks = active_masks[traj_indices]
-        assert traj_active_masks.all(), "active_masks should be all 1s for the same trajectory"
-        sf = (traj_action_novelty.softmax(0)) * 1.0
-        softmax_by_traj[uid] = sf
-
-    #     is_all_zero = torch.all(torch.abs(traj_action_novelty) < 1e-8).item()
-    #     lst.append(1.0 if is_all_zero else 0.0)
-    # ratios = sum(lst)/len(lst)
-    # print("[TEST: last action token probs]:", traj_action_novelty)
-    # print("[TEST: lastaction token probs softmax]:", sf)
-    # print("[TEST: non ratios]:", ratios, len(lst))
-
-    # Recombine the returns into the original batch order
-    all_probs_by_traj = torch.zeros_like(action_novelty,device=action_novelty.device)
-
-    for i, uid in enumerate(traj_uids):
-        traj_indices = np.where(traj_uids == uid)[0]
-        idx_in_traj = np.where(traj_indices == i)[0][0]  # Find position of i in its trajectory
-        all_probs_by_traj[i] = softmax_by_traj[uid][idx_in_traj]
-
-    all_probs_by_traj = torch.tensor(all_probs_by_traj, dtype=torch.float32, device=batch.batch['input_ids'].device)
-    return all_probs_by_traj
-
-
 def compute_step_discounted_returns(batch: DataProto, gamma: float):
     """
     Compute discounted returns for each trajectory. (Eq. 5 in the paper)

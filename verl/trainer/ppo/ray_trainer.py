@@ -61,7 +61,7 @@ from verl.utils.torch_functional import masked_mean
 from verl.utils.tracking import ValidationGenerationsLogger
 from verl.workers.rollout.async_server import AsyncLLMServerManager
 from gigpo import core_gigpo
-
+from qapo import qapo
 from agent_system.multi_turn_rollout import TrajectoryCollector, adjust_batch
 
 WorkerType = Type[Worker]
@@ -115,7 +115,7 @@ class ResourcePoolManager:
             resource_pool = RayResourcePool(process_on_nodes=process_on_nodes, use_gpu=True, max_colocate_count=1, name_prefix=resource_pool_name)
             self.resource_pool_dict[resource_pool_name] = resource_pool
 
-        self._check_resource_available()
+        #self._check_resource_available()
 
     def get_resource_pool(self, role: Role) -> RayResourcePool:
         """Get the resource pool of the worker_cls"""
@@ -1133,17 +1133,12 @@ class RayPPOTrainer:
                         entropy_loss = agg_loss(loss_mat=entropys, loss_mask=response_masks, loss_agg_mode=loss_agg_mode)
                         old_log_prob_metrics = {"actor/entropy_loss": entropy_loss.detach().item()}
                         if novelty_enable: 
-                            action_novelty = old_log_prob.batch["action_novelty"]
-                            step_credits = core_gigpo.compute_step_credits(batch, action_novelty)
+                            step_credits = qapo.compute_step_credits(batch)
                             metrics.update(
                                 {
-                                        "training/action_novelty_mean": step_credits.detach().mean().item(),
-                                        "training/action_novelty_max": step_credits.detach().max().item(),
-                                        "training/action_novelty_min": step_credits.detach().min().item(),
-                                        # "training/index_lst_mean": index_lst.mean().item(),
-                                        # "training/index_lst_max": index_lst.max().item(),
-                                        # "training/index_lst_min": index_lst.min().item(),
-
+                                        "training/step_credits_mean": step_credits.detach().mean().item(),
+                                        "training/step_credits_max": step_credits.detach().max().item(),
+                                        "training/step_credits_min": step_credits.detach().min().item(),
                                 }
                             )
                         metrics.update(old_log_prob_metrics)
@@ -1239,9 +1234,8 @@ class RayPPOTrainer:
                             metrics.update(kl_metrics)
                         else:
                             batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
-                        #batch.batch['step_rewards'] = batch.batch["token_level_rewards"].sum(-1)
-                        # compute advantages, executed on the driver process
 
+                        # compute advantages, executed on the driver process
                         norm_adv_by_std_in_grpo = self.config.algorithm.get("norm_adv_by_std_in_grpo", True)  # GRPO adv normalization factor
 
                         batch = compute_advantage(
