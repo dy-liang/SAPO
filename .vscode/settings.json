@@ -11,5 +11,20 @@
         "initializer_list": "cpp",
         "utility": "cpp"
     },
-    "iis.configDir": ""
+    "iis.configDir": "",
+    "terminal.integrated.profiles.linux": {
+    "hly": {
+        "path": "/bin/bash",
+        "args": [
+        "-c",
+        "su - hly"]
+    },
+    "hly_tty": {
+        "path": "/bin/bash",
+        "args": [
+        "-c",
+        "su - hly -c 'cd /home/hly/projects/llm-agent/verl-agent && exec bash'"        ]
+    }
+    },
+    "terminal.integrated.defaultProfile.linux": "hly"
 }

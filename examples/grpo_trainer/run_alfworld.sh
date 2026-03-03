@@ -1,10 +1,10 @@
 set -x
 ENGINE=${1:-vllm}
 export VLLM_ATTENTION_BACKEND=XFORMERS
-export CUDA_VISIBLE_DEVICES=0 #ps -ef | grep "+logits_swtich" | grep -v grep
+export CUDA_VISIBLE_DEVICES=3 #ps -ef | grep "+logits_swtich" | grep -v grep
 export HYDRA_FULL_ERROR=1
-num_cpus_per_env_worker=0.1 # The CPU resource allocated for each environment worker. If you want to use less CPU resources, you can decrease this value.
-
+num_cpus_per_env_worker=0.05 # The CPU resource allocated for each environment worker. If you want to use less CPU resources, you can decrease this value.
+export HF_ENDPOINT=https://hf-mirror.com
 train_data_size=16
 val_data_size=128
 group_size=8
@@ -40,7 +40,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=32 \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
     actor_rollout_ref.rollout.name=$ENGINE \
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.8 \
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.45 \
     actor_rollout_ref.rollout.enable_chunked_prefill=False \
     actor_rollout_ref.rollout.enforce_eager=False \
     actor_rollout_ref.rollout.free_cache_engine=False \
@@ -60,12 +60,12 @@ python3 -m verl.trainer.main_ppo \
     trainer.critic_warmup=0 \
     trainer.logger=['console','wandb'] \
     trainer.project_name='verl_agent_alfworld' \
-    trainer.experiment_name='grpo_200_qwen2.5_1.5b_s3_1_pos1_all0' \
+    trainer.experiment_name='grpo_200_128_qwen2.5_1.5b_s3_1_S100T_mean' \
     trainer.n_gpus_per_node=1 \
     trainer.nnodes=1 \
     trainer.save_freq=-1 \
     trainer.test_freq=5 \
-    trainer.total_epochs=200 \
+    trainer.total_epochs=150 \
     trainer.val_before_train=True $@
 
 #sh /home/hly/projects/llm-agent/verl-agent/gpu.sh  grpo_200_qwen2.5_1.5b_s0_2_credit_v2_pos5-0.2

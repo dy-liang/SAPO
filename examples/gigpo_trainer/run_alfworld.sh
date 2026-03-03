@@ -63,19 +63,19 @@ python3 -m verl.trainer.main_ppo \
     algorithm.gigpo.step_advantage_w=1.0 \
     algorithm.gigpo.mode=$mode \
     env.env_name=alfworld/AlfredTWEnv \
-    env.seed=3 \
+    env.seed=0 \
     env.max_steps=50 \
     env.rollout.n=$group_size \
     env.resources_per_worker.num_cpus=$num_cpus_per_env_worker \
     trainer.critic_warmup=0 \
     trainer.logger=['console','wandb'] \
     trainer.project_name='verl_agent_alfworld' \
-    trainer.experiment_name='gigpo_qwen2.5_1.5b_128_200_s3_1_origin' \
+    trainer.experiment_name='gigpo_qwen2.5_1.5b_128_200_s0_1_origin' \
     trainer.n_gpus_per_node=1 \
     trainer.nnodes=1 \
     trainer.save_freq=-1 \
     trainer.test_freq=5 \
-    trainer.total_epochs=200 \
+    trainer.total_epochs=150 \
     trainer.val_before_train=True $@
 
 # bash ./gpu.sh

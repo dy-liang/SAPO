@@ -71,9 +71,12 @@ class EpisodeRewardManager:
 
             if step_credits!=None:
                 if data_item.non_tensor_batch['episode_rewards'] > 5.0:
-                    episode_rewards = data_item.non_tensor_batch['episode_rewards'] * step_credits[i] # multiple credit value
+                    step_len_rewards = data_item.non_tensor_batch['episode_rewards'] * step_credits[i] * 10.0 # multiple credit value
+                    token_len_rewards = step_len_rewards / valid_response_length
+                    episode_rewards = token_len_rewards 
+                    #episode_rewards = episode_rewards + 2.0 / valid_response_length
                 elif data_item.non_tensor_batch['episode_rewards'] == 0.0:
-                    episode_rewards = step_credits[i] * 1.0 # positive all 1.0
+                    episode_rewards = step_credits[i] * 0.0 # positive all 1.0
                 else:
                     episode_rewards = data_item.non_tensor_batch['episode_rewards']
             else:
