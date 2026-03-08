@@ -17,6 +17,15 @@ from verl import DataProto
 import torch
 import numpy as np
 
+def linear_decay(epoch, start_epoch=0, end_epoch=150, start_value=1.0, end_value=0.0):
+    if epoch <= start_epoch:
+        return start_value
+    if epoch >= end_epoch:
+        return end_value
+
+    progress = (epoch - start_epoch) / (end_epoch - start_epoch)
+    return start_value + progress * (end_value - start_value)
+
 class EpisodeRewardManager:
     """The reward manager.
     """
@@ -26,7 +35,7 @@ class EpisodeRewardManager:
         self.num_examine = num_examine  # the number of batches of decoded responses to print to the console
         self.normalize_by_length = normalize_by_length
 
-    def __call__(self, data: DataProto, step_credits, return_dict=False):
+    def __call__(self, data: DataProto, step_credits, epoch, return_dict=False):
         """We will expand this function gradually based on the available datasets"""
 
         # If there is rm score, we directly return rm score. Otherwise, we compute via rm_score_fn
@@ -71,9 +80,17 @@ class EpisodeRewardManager:
 
             if step_credits!=None:
                 if data_item.non_tensor_batch['episode_rewards'] > 5.0:
-                    step_len_rewards = data_item.non_tensor_batch['episode_rewards'] * step_credits[i] * 10.0 # multiple credit value
-                    token_len_rewards = step_len_rewards / valid_response_length
-                    episode_rewards = token_len_rewards 
+                    step_len_rewards = data_item.non_tensor_batch['episode_rewards'] * step_credits[i] # multiple credit value (3,7,25)
+                    #token_len_rewards = 2.0 / valid_response_length
+                    token_len_rewards = 10.0 / valid_response_length #(50)[0.01, 0.2, 2.5]  
+                    if epoch >= 100: token_len_rewards = 1.0 / valid_response_length
+                    
+                    #token_len_rewards = (linear_decay(epoch) * 10.0) / valid_response_length #(50)[0.01, 0.2, 2.5]
+
+                    #token_len_rewards = token_len_rewards if token_len_rewards>=0.1 else 0.1
+                    #token_len_rewards = token_len_rewards if token_len_rewards<=0.30 else 0.30
+                    #base_rewards = 0.0
+                    episode_rewards = step_len_rewards #token_len_rewards + 
                     #episode_rewards = episode_rewards + 2.0 / valid_response_length
                 elif data_item.non_tensor_batch['episode_rewards'] == 0.0:
                     episode_rewards = step_credits[i] * 0.0 # positive all 1.0

@@ -763,7 +763,7 @@ class RayPPOTrainer:
             # test_batch = test_batch.union(test_output_gen_batch)
 
             # evaluate using reward_function
-            result = self.val_reward_fn(test_batch, step_credits=None, return_dict=True)
+            result = self.val_reward_fn(test_batch, step_credits=None, epoch=0, return_dict=True)
             reward_tensor = result["reward_tensor"]
             scores = reward_tensor.sum(-1).cpu().tolist()
             sample_scores.extend(scores)
@@ -1109,7 +1109,7 @@ class RayPPOTrainer:
                     del batch
                     batch = gen_batch_output
 
-                    #batch = adjust_batch(self.config, batch)
+                    batch = adjust_batch(self.config, batch)
 
                     batch.batch["response_mask"] = compute_response_mask(batch)
                     # balance the number of valid tokens on each dp rank.
@@ -1180,9 +1180,9 @@ class RayPPOTrainer:
                         else:
                             if not novelty_enable: 
                                 step_credits = None
-                            reward_tensor, step_rewards, reward_extra_infos_dict = compute_reward(batch, step_credits, self.reward_fn)
+                            reward_tensor, step_rewards, reward_extra_infos_dict = compute_reward(batch, step_credits, epoch, self.reward_fn)
                             batch.non_tensor_batch['rewards'] = step_rewards # for gigpo returns
-                            batch.batch["token_level_scores"] = reward_tensor # for grpo
+                            #batch.batch["token_level_scores"] = reward_tensor # for grpo
                             #print("step rew:",batch.non_tensor_batch['rewards'])
                             #print("token rew:",batch.batch["token_level_scores"].sum(-1))
 
@@ -1192,8 +1192,6 @@ class RayPPOTrainer:
                             gamma=self.config.algorithm.gamma
                         )
                         batch.batch['step_rewards'] = step_rewards_tensor # note: step_rewards does not act outcome broadcasting.
-
-                    batch = adjust_batch(self.config, batch)
 
                     if self.use_reference_policy:
                         # compute reference log_prob
@@ -1215,7 +1213,7 @@ class RayPPOTrainer:
                         reward_extra_infos_dict: dict[str, list]
                         if self.config.reward_model.launch_reward_fn_async:
                             reward_tensor, reward_extra_infos_dict = ray.get(future_reward)
-                        #batch.batch["token_level_scores"] = reward_tensor
+                        batch.batch["token_level_scores"] = reward_tensor
 
                         print(f"{list(reward_extra_infos_dict.keys())=}")
                         if reward_extra_infos_dict:

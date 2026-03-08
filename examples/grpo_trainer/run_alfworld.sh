@@ -1,7 +1,7 @@
 set -x
 ENGINE=${1:-vllm}
 export VLLM_ATTENTION_BACKEND=XFORMERS
-export CUDA_VISIBLE_DEVICES=3 #ps -ef | grep "+logits_swtich" | grep -v grep
+export CUDA_VISIBLE_DEVICES=2 #ps -ef | grep "+logits_swtich" | grep -v grep
 export HYDRA_FULL_ERROR=1
 num_cpus_per_env_worker=0.05 # The CPU resource allocated for each environment worker. If you want to use less CPU resources, you can decrease this value.
 export HF_ENDPOINT=https://hf-mirror.com
@@ -10,6 +10,8 @@ val_data_size=128
 group_size=8
 
 # We only use data preparation to indicate the modality and the data size. pkill -f "_mask"
+# nohup bash examples/grpo_trainer/run_alfworld.sh > ./test_grpo_200_128_1.5b_s3_6_S10T10_step1001.log 2>&1 &
+# nohup bash examples/grpo_trainer/run_alfworld.sh > ./test_grpo_200_128_1.5b_s3_5_S10T10_decay0.log 2>&1 &
 python3 -m examples.data_preprocess.prepare \
     --mode 'text' \
     --train_data_size $train_data_size \
@@ -60,7 +62,7 @@ python3 -m verl.trainer.main_ppo \
     trainer.critic_warmup=0 \
     trainer.logger=['console','wandb'] \
     trainer.project_name='verl_agent_alfworld' \
-    trainer.experiment_name='grpo_200_128_qwen2.5_1.5b_s3_1_S100T_mean' \
+    trainer.experiment_name='grpo_qwen2.5_1.5b_s3_3_S10T10_step1001' \
     trainer.n_gpus_per_node=1 \
     trainer.nnodes=1 \
     trainer.save_freq=-1 \

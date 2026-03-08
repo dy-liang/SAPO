@@ -1,7 +1,7 @@
 set -x
 ENGINE=${1:-vllm}
 export VLLM_ATTENTION_BACKEND=XFORMERS
-export CUDA_VISIBLE_DEVICES=0 #ps -ef | grep "+logits_swtich" | grep -v grep
+export CUDA_VISIBLE_DEVICES=2 #ps -ef | grep "+logits_swtich" | grep -v grep
 
 num_cpus_per_env_worker=0.05 # The CPU resource allocated for each environment worker. If you want to use less CPU resources, you can decrease this value.
 
@@ -15,10 +15,10 @@ mode="mean_std_norm" # "mean_norm" or "mean_std_norm" bash examples/gigpo_traine
 # nohup bash examples/gigpo_trainer/run_alfworld.sh > ./test_s0_1_0.001_0.05_nodet.log 2>&1 &
 # nohup bash examples/gigpo_trainer/run_alfworld.sh > ./test_s0_0_v1_seed0.log 2>&1 & nohup bash examples/gigpo_trainer/run_alfworld.sh > ./test_gigpo_200_s1_credit_all_pos1.log 2>&1 &
 
-python3 -m examples.data_preprocess.prepare \
-    --mode 'text' \
-    --train_data_size $train_data_size \
-    --val_data_size $val_data_size
+# python3 -m examples.data_preprocess.prepare \
+#     --mode 'text' \
+#     --train_data_size $train_data_size \
+#     --val_data_size $val_data_size
 
 python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=gigpo \
@@ -45,7 +45,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=32 \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
     actor_rollout_ref.rollout.name=$ENGINE \
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.8 \
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.45 \
     actor_rollout_ref.rollout.enable_chunked_prefill=False \
     actor_rollout_ref.rollout.enforce_eager=False \
     actor_rollout_ref.rollout.free_cache_engine=False \
