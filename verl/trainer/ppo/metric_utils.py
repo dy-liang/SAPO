@@ -103,6 +103,9 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> Dict[str,
     sequence_reward = batch.batch["token_level_rewards"].sum(-1)
 
     advantages = batch.batch["advantages"]
+    grpo_advantages = batch.batch["grpo_advantages"]
+    len_advantages = batch.batch["len_advantages"]
+
     returns = batch.batch["returns"]
 
     max_response_length = batch.batch["responses"].shape[-1]
@@ -117,6 +120,9 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> Dict[str,
     response_length = response_info["response_length"]
 
     valid_adv = torch.masked_select(advantages, response_mask)
+    valid_grpo_adv = torch.masked_select(grpo_advantages, response_mask)
+    valid_len_adv = torch.masked_select(len_advantages, response_mask)
+
     valid_returns = torch.masked_select(returns, response_mask)
     unique_traj_uid, unique_idx = np.unique(batch.non_tensor_batch['traj_uid'], return_index=True)
 
@@ -139,6 +145,14 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> Dict[str,
         "critic/advantages/mean": torch.mean(valid_adv).detach().item(),
         "critic/advantages/max": torch.max(valid_adv).detach().item(),
         "critic/advantages/min": torch.min(valid_adv).detach().item(),
+        # adv
+        "critic/grpo_advantages/mean": torch.mean(valid_grpo_adv).detach().item(),
+        "critic/grpo_advantages/max": torch.max(valid_grpo_adv).detach().item(),
+        "critic/grpo_advantages/min": torch.min(valid_grpo_adv).detach().item(),
+        # adv
+        "critic/len_advantages/mean": torch.mean(valid_len_adv).detach().item(),
+        "critic/len_advantages/max": torch.max(valid_len_adv).detach().item(),
+        "critic/len_advantages/min": torch.min(valid_len_adv).detach().item(),
         # returns
         "critic/returns/mean": torch.mean(valid_returns).detach().item(),
         "critic/returns/max": torch.max(valid_returns).detach().item(),

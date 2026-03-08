@@ -112,14 +112,14 @@ def compute_reward(data: DataProto, step_credits, epoch, reward_fn):
     try:
         reward_result = reward_fn(data, step_credits, epoch, return_dict=True)
         reward_tensor = reward_result["reward_tensor"]
-        step_rewards = reward_result["step_rewards"]
+        len_reward_tensor = reward_result["len_reward_tensor"]
         reward_extra_infos_dict = reward_result["reward_extra_info"]
     except Exception as e:
         print(f"Error in reward_fn: {e}")
         reward_tensor = reward_fn(data)
         reward_extra_infos_dict = {}
 
-    return reward_tensor, step_rewards, reward_extra_infos_dict
+    return reward_tensor, len_reward_tensor, reward_extra_infos_dict
 
 
 @ray.remote(num_cpus=1)
