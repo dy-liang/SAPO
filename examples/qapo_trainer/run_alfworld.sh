@@ -11,7 +11,7 @@ group_size=8
 
 # We only use data preparation to indicate the modality and the data size. pkill -f "_mask"
 # nohup bash examples/qapo_trainer/run_alfworld.sh > ./test_qapo_200_128_1.5b_s3_1_S100T_w1.log 2>&1 &
-# nohup bash examples/grpo_trainer/run_alfworld.sh > ./test_grpo_200_128_1.5b_s3_5_S10T10_decay0.log 2>&1 &
+# nohup bash examples/qapo_trainer/run_alfworld.sh > ./test_qapo_200_128_1.5b_s3_1_S10T10_w1.log 2>&1 &
 python3 -m examples.data_preprocess.prepare \
     --mode 'text' \
     --train_data_size $train_data_size \
@@ -62,7 +62,7 @@ python3 -m verl.trainer.main_ppo \
     trainer.critic_warmup=0 \
     trainer.logger=['console','wandb'] \
     trainer.project_name='verl_agent_alfworld' \
-    trainer.experiment_name='qapo_qwen2.5_1.5b_s3_1_S100T_w1' \
+    trainer.experiment_name='qapo_qwen2.5_1.5b_s3_1_S10T10_w1' \
     trainer.n_gpus_per_node=1 \
     trainer.nnodes=1 \
     trainer.save_freq=-1 \

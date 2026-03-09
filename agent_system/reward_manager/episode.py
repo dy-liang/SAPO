@@ -81,16 +81,18 @@ class EpisodeRewardManager:
             len_episode_rewards = data_item.non_tensor_batch['episode_rewards']
             if step_credits!=None:
                 if data_item.non_tensor_batch['episode_rewards'] > 5.0:
-                    step_len_rewards = data_item.non_tensor_batch['episode_rewards'] * step_credits[i] * 10.0 # multiple credit value (3,7,25)
+                    step_len_rewards = data_item.non_tensor_batch['episode_rewards'] * step_credits[i] * 1.0 # multiple credit value (3,7,25)
                     #token_len_rewards = 2.0 / valid_response_length
                     #token_len_rewards = (linear_decay(epoch) * 10.0) / valid_response_length #(50)[0.01, 0.2, 2.5]
-                    token_len_rewards = step_len_rewards / valid_response_length #(50)[0.01, 0.2, 2.5]  
+                    token_len_rewards = 10.0 / valid_response_length #(50)[0.01, 0.2, 2.5]  
                     #if epoch >= 100: token_len_rewards = 1.0 / valid_response_length
-                    len_episode_rewards = token_len_rewards #+ step_len_rewards
+                    len_episode_rewards = token_len_rewards + step_len_rewards
                 else:
                     len_episode_rewards = data_item.non_tensor_batch['episode_rewards']
 
             episode_rewards = data_item.non_tensor_batch['episode_rewards']
+
+            episode_lengths = data_item.non_tensor_batch['episode_lengths']
 
             if self.normalize_by_length:
                 score = episode_rewards / episode_lengths

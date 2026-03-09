@@ -130,25 +130,25 @@ def compute_qapo_outcome_advantage(
     compute_mean_std_cross_steps: bool = True,
     advantage_w: float = 1.0,
 ):
-    advantages = compute_group_outcome_advantage(
-            token_level_rewards,
-            response_mask,
-            index,
-            traj_index,
-            norm_adv_by_std_in_grpo,
+    grpo_advantages = compute_grpo_outcome_advantage(
+            token_level_rewards=token_level_rewards,
+            response_mask=response_mask,
+            index=index,
+            traj_index=traj_index,
+            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
         )
-    len_advantages = compute_group_outcome_advantage(
-            token_level_len_rewards,
-            response_mask,
-            index,
-            traj_index,
-            norm_adv_by_std_in_grpo,
+    len_advantages = compute_grpo_outcome_advantage(
+            token_level_rewards=token_level_len_rewards,
+            response_mask=response_mask,
+            index=index,
+            traj_index=traj_index,
+            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
         )
-    scores = advantages + advantage_w * len_advantages
-    return scores, scores, advantages, len_advantages
+    scores = grpo_advantages + advantage_w * len_advantages
+    return scores, scores, grpo_advantages, len_advantages
 
 # NOTE(sgm): this implementation only consider outcome supervision, where the reward is a scalar.
-def compute_group_outcome_advantage(
+def compute_grpo_outcome_advantage(
     token_level_rewards: torch.Tensor,
     response_mask: torch.Tensor,
     index: np.ndarray,
@@ -180,7 +180,6 @@ def compute_group_outcome_advantage(
             shape is (bs, response_length)
     """
     scores = token_level_rewards.sum(dim=-1)
-
     id2score = defaultdict(list)
     id2mean = {}
     id2std = {}

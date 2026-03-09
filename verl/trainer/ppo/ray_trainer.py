@@ -200,6 +200,8 @@ def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, 
 
 def apply_invalid_action_penalty(data: DataProto, invalid_action_penalty_coef=float):
     reward_tensor = data.batch['token_level_scores']
+    len_reward_tensor = data.batch['token_level_len_scores']
+
     if 'step_rewards' in data.batch.keys():
         step_rewards = data.batch['step_rewards']
     for i in range(len(data)):
@@ -216,6 +218,7 @@ def apply_invalid_action_penalty(data: DataProto, invalid_action_penalty_coef=fl
         # invalid action penalty
         # assert reward_tensor[i, valid_response_length - 1] != 0.0, f'i={i}'
         reward_tensor[i, valid_response_length - 1] -= invalid_action_penalty_coef * action_invalids
+        len_reward_tensor[i, valid_response_length - 1] -= invalid_action_penalty_coef * action_invalids
 
         if 'step_rewards' in data.batch.keys():
             step_rewards[i] -= invalid_action_penalty_coef * action_invalids
