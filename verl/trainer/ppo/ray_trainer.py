@@ -28,7 +28,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from pprint import pprint
 from typing import Dict, Optional, Type
-
+import weave
 import numpy as np
 import ray
 import torch
@@ -200,7 +200,8 @@ def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, 
 
 def apply_invalid_action_penalty(data: DataProto, invalid_action_penalty_coef=float):
     reward_tensor = data.batch['token_level_scores']
-    len_reward_tensor = data.batch['token_level_len_scores']
+    step_level_len_scores = data.batch['step_level_len_scores']
+    #token_level_len_scores = data.batch['token_level_len_scores']
 
     if 'step_rewards' in data.batch.keys():
         step_rewards = data.batch['step_rewards']
@@ -218,7 +219,8 @@ def apply_invalid_action_penalty(data: DataProto, invalid_action_penalty_coef=fl
         # invalid action penalty
         # assert reward_tensor[i, valid_response_length - 1] != 0.0, f'i={i}'
         reward_tensor[i, valid_response_length - 1] -= invalid_action_penalty_coef * action_invalids
-        len_reward_tensor[i, valid_response_length - 1] -= invalid_action_penalty_coef * action_invalids
+        step_level_len_scores[i, valid_response_length - 1] -= invalid_action_penalty_coef * action_invalids
+        #token_level_len_scores[i, valid_response_length - 1] -= invalid_action_penalty_coef * action_invalids
 
         if 'step_rewards' in data.batch.keys():
             step_rewards[i] -= invalid_action_penalty_coef * action_invalids
@@ -245,7 +247,7 @@ def compute_response_mask(data: DataProto):
     return attention_mask[:, -response_length:]
 
 
-def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_repeat=1, multi_turn=False, norm_adv_by_std_in_grpo=True, step_advantage_w=1.0, gigpo_mode="mean_std_norm", gigpo_enable_similarity=False, gigpo_similarity_thresh=0.95, **kwargs):
+def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_repeat=1, multi_turn=False, norm_adv_by_std_in_grpo=True, step_advantage_w=1.0, gigpo_mode="mean_std_norm", gigpo_enable_similarity=False, gigpo_similarity_thresh=0.95, mix_adv_type="grpo1", epoch=None,**kwargs):
     """Compute advantage estimates for policy optimization.
 
     This function computes advantage estimates using various estimators like GAE, GRPO, REINFORCE++, etc.
@@ -309,18 +311,22 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
             response_length = grpo_calculation_mask.size(1)  # Get length from the initial response mask
             grpo_calculation_mask = data.batch["loss_mask"][:, -response_length:]  # This mask is the one intended for GRPO
         # Call compute_grpo_outcome_advantage with parameters matching its definition
-        advantages, returns, grpo_advantages, len_advantages = qapo.compute_qapo_outcome_advantage(
+        advantages, returns, grpo_advantages, step_len_advantages, token_len_advantages = qapo.compute_qapo_outcome_advantage(
             token_level_rewards=data.batch["token_level_rewards"],
+            step_level_len_rewards=data.batch["step_level_len_rewards"],
             token_level_len_rewards=data.batch["token_level_len_rewards"],
             response_mask=grpo_calculation_mask,
             index=data.non_tensor_batch["uid"],
             traj_index=data.non_tensor_batch['traj_uid'],
             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+            mix_adv_type=mix_adv_type,
+            epoch=epoch
         )
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns
         data.batch["grpo_advantages"] = grpo_advantages
-        data.batch["len_advantages"] = len_advantages
+        data.batch["step_len_advantages"] = step_len_advantages
+        data.batch["token_len_advantages"] = token_len_advantages
 
     elif adv_estimator == AdvantageEstimator.GRPO_PASSK:
         advantages, returns = core_algos.compute_grpo_passk_outcome_advantage(
@@ -461,6 +467,7 @@ class RayPPOTrainer:
 
         # if ref_in_actor is True, the reference policy will be actor without lora applied
         self.ref_in_actor = config.actor_rollout_ref.model.get('lora_rank', 0) > 0
+        self.mix_adv_type = config.actor_rollout_ref.novelty_module.get('mix_adv_type', 'grpo1')
 
         # define in-reward KL control
         # kl loss control currently not suppoorted
@@ -1206,7 +1213,7 @@ class RayPPOTrainer:
                         else:
                             if self.config.algorithm.adv_estimator != AdvantageEstimator.QAPO: 
                                 step_credits = None
-                            reward_tensor, len_reward_tensor, reward_extra_infos_dict = compute_reward(batch, step_credits, epoch, self.reward_fn)
+                            reward_tensor, len_reward_tensor, token_len_reward_tensor, reward_extra_infos_dict = compute_reward(batch, step_credits, epoch, self.reward_fn)
 
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.GiGPO: # TODO:Address adjusted batch issue
                         step_rewards_tensor = core_gigpo.compute_step_discounted_returns(
@@ -1236,7 +1243,8 @@ class RayPPOTrainer:
                         if self.config.reward_model.launch_reward_fn_async:
                             reward_tensor, reward_extra_infos_dict = ray.get(future_reward)
                         batch.batch["token_level_scores"] = reward_tensor
-                        batch.batch["token_level_len_scores"] = len_reward_tensor
+                        batch.batch["step_level_len_scores"] = len_reward_tensor
+                        batch.batch["token_level_len_scores"] = token_len_reward_tensor
 
                         print(f"{list(reward_extra_infos_dict.keys())=}")
                         if reward_extra_infos_dict:
@@ -1255,6 +1263,7 @@ class RayPPOTrainer:
                             metrics.update(kl_metrics)
                         else:
                             batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
+                            batch.batch["step_level_len_rewards"] = batch.batch["step_level_len_scores"]
                             batch.batch["token_level_len_rewards"] = batch.batch["token_level_len_scores"]
 
                         # compute advantages, executed on the driver process
@@ -1275,6 +1284,8 @@ class RayPPOTrainer:
                             gigpo_mode=self.config.algorithm.gigpo.mode,
                             gigpo_enable_similarity= self.config.algorithm.gigpo.enable_similarity,
                             gigpo_similarity_thresh=self.config.algorithm.gigpo.similarity_thresh,
+                            mix_adv_type=self.mix_adv_type,
+                            epoch=epoch,
                         )
 
                     # update critic

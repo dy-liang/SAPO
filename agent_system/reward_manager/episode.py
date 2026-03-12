@@ -47,6 +47,7 @@ class EpisodeRewardManager:
 
         reward_tensor = torch.zeros_like(data.batch['responses'], dtype=torch.float32)
         len_reward_tensor = torch.zeros_like(data.batch['responses'], dtype=torch.float32)
+        token_len_reward_tensor = torch.zeros_like(data.batch['responses'], dtype=torch.float32)
 
         already_print_data_sources = {}
 
@@ -79,16 +80,19 @@ class EpisodeRewardManager:
                 image_grid_thw = multi_modal_inputs['image_grid_thw']
 
             len_episode_rewards = data_item.non_tensor_batch['episode_rewards']
+            token_len_rewards = data_item.non_tensor_batch['episode_rewards']
             if step_credits!=None:
                 if data_item.non_tensor_batch['episode_rewards'] > 5.0:
-                    step_len_rewards = data_item.non_tensor_batch['episode_rewards'] * step_credits[i] * 1.0 # multiple credit value (3,7,25)
+                    len_episode_rewards = data_item.non_tensor_batch['episode_rewards'] * step_credits[i] * 1.0 # multiple credit value (3,7,25)
+                    token_len_rewards = 10.0 / valid_response_length #(50)[0.01, 0.2, 2.5]  
                     #token_len_rewards = 2.0 / valid_response_length
                     #token_len_rewards = (linear_decay(epoch) * 10.0) / valid_response_length #(50)[0.01, 0.2, 2.5]
-                    token_len_rewards = 10.0 / valid_response_length #(50)[0.01, 0.2, 2.5]  
+                    #token_len_rewards = 10.0 / valid_response_length #(50)[0.01, 0.2, 2.5]  
                     #if epoch >= 100: token_len_rewards = 1.0 / valid_response_length
-                    len_episode_rewards = token_len_rewards + step_len_rewards
+                    #len_episode_rewards =  step_len_rewards #+ token_len_rewards
                 else:
                     len_episode_rewards = data_item.non_tensor_batch['episode_rewards']
+                    token_len_rewards = data_item.non_tensor_batch['episode_rewards']
 
             episode_rewards = data_item.non_tensor_batch['episode_rewards']
 
@@ -100,6 +104,7 @@ class EpisodeRewardManager:
                 score = episode_rewards
             reward_tensor[i, valid_response_length - 1] = torch.tensor(score, dtype=torch.float32, device=prompt_ids.device)
             len_reward_tensor[i, valid_response_length - 1] = torch.tensor(len_episode_rewards, dtype=torch.float32, device=prompt_ids.device)
+            token_len_reward_tensor[i, valid_response_length - 1] = torch.tensor(token_len_rewards, dtype=torch.float32, device=prompt_ids.device)
 
             if data_source not in already_print_data_sources:
                 already_print_data_sources[data_source] = 0
@@ -114,6 +119,7 @@ class EpisodeRewardManager:
             return {
                 "reward_tensor": reward_tensor,
                 "len_reward_tensor": len_reward_tensor,
+                "token_len_reward_tensor": token_len_reward_tensor,
                 "reward_extra_info": {}
             }
         else:

@@ -119,17 +119,31 @@ def compute_step_credits(batch):
     all_uid_trj_vals = torch.tensor(all_uid_trj_vals, dtype=torch.float32, device=batch.batch['input_ids'].device)
     return all_uid_trj_vals
 
+def linear_decay(epoch, start_epoch=0, end_epoch=150, start_value=1.0, end_value=0.0):
+    if epoch <= start_epoch:
+        return start_value
+    if epoch >= end_epoch:
+        return end_value
+    progress = (epoch - start_epoch) / (end_epoch - start_epoch)
+    return start_value + progress * (end_value - start_value)
+
 def compute_qapo_outcome_advantage(
     token_level_rewards: torch.Tensor,
+    step_level_len_rewards: torch.Tensor,
     token_level_len_rewards: torch.Tensor,
     response_mask: torch.Tensor,
     index: np.ndarray,
     traj_index: np.ndarray,
     epsilon: float = 1e-6,
     norm_adv_by_std_in_grpo: str = True,
+    mix_adv_type: str = True,
+    epoch: int = 0,
     compute_mean_std_cross_steps: bool = True,
-    advantage_w: float = 1.0,
+    advantage_wg: float = 0.0,
+    advantage_ws: float = 1.0,
+    advantage_wt: float = 0.2,
 ):
+    print(mix_adv_type)
     grpo_advantages = compute_grpo_outcome_advantage(
             token_level_rewards=token_level_rewards,
             response_mask=response_mask,
@@ -137,15 +151,24 @@ def compute_qapo_outcome_advantage(
             traj_index=traj_index,
             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
         )
-    len_advantages = compute_grpo_outcome_advantage(
+    step_len_advantages = compute_grpo_outcome_advantage(
+            token_level_rewards=step_level_len_rewards,
+            response_mask=response_mask,
+            index=index,
+            traj_index=traj_index,
+            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+        )
+    token_len_advantages = compute_grpo_outcome_advantage(
             token_level_rewards=token_level_len_rewards,
             response_mask=response_mask,
             index=index,
             traj_index=traj_index,
             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
         )
-    scores = grpo_advantages + advantage_w * len_advantages
-    return scores, scores, grpo_advantages, len_advantages
+    #advantage_wt = linear_decay(epoch) * advantage_wt
+    if epoch > 75: advantage_wt = 0.02
+    scores = advantage_wg * grpo_advantages + advantage_ws * step_len_advantages + advantage_wt * token_len_advantages
+    return scores, scores, grpo_advantages, step_len_advantages, token_len_advantages
 
 # NOTE(sgm): this implementation only consider outcome supervision, where the reward is a scalar.
 def compute_grpo_outcome_advantage(

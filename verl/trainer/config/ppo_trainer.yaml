@@ -27,6 +27,7 @@ data:
 actor_rollout_ref:
   hybrid_engine: True
   novelty_module:
+    mix_adv_type: grpo1
     enable: False
     novelty_coef: 0.001
     novelty_max: 0.1

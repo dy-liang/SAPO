@@ -142,7 +142,7 @@ def compute_grpo_outcome_advantage(
             shape is (bs, response_length)
     """
     scores = token_level_rewards.sum(dim=-1)
-    print(scores)
+
     id2score = defaultdict(list)
     id2mean = {}
     id2std = {}

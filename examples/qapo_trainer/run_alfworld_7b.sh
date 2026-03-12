@@ -63,7 +63,7 @@ python3 -m verl.trainer.main_ppo \
     trainer.critic_warmup=0 \
     trainer.logger=['console','wandb'] \
     trainer.project_name='verl_agent_alfworld' \
-    trainer.experiment_name='qapo_qwen2.5_7b_s3_1_S10T10_w1' \
+    trainer.experiment_name='qapo_qwen2.5_7b_s3_1_S10T2_w1' \
     trainer.n_gpus_per_node=2 \
     trainer.nnodes=1 \
     trainer.save_freq=-1 \

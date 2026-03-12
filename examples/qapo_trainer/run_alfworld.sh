@@ -3,15 +3,15 @@ ENGINE=${1:-vllm}
 export VLLM_ATTENTION_BACKEND=XFORMERS
 export CUDA_VISIBLE_DEVICES=3 #ps -ef | grep "+logits_swtich" | grep -v grep
 export HYDRA_FULL_ERROR=1
-num_cpus_per_env_worker=0.05 # The CPU resource allocated for each environment worker. If you want to use less CPU resources, you can decrease this value.
+num_cpus_per_env_worker=0.1 # The CPU resource allocated for each environment worker. If you want to use less CPU resources, you can decrease this value.
 export HF_ENDPOINT=https://hf-mirror.com
 train_data_size=16
 val_data_size=128
 group_size=8
 
 # We only use data preparation to indicate the modality and the data size. pkill -f "_mask"
-# nohup bash examples/qapo_trainer/run_alfworld.sh > ./test_qapo_200_128_1.5b_s3_1_S100T_w1.log 2>&1 &
-# nohup bash examples/qapo_trainer/run_alfworld.sh > ./test_qapo_200_128_1.5b_s3_1_S10T10_w1.log 2>&1 &
+# nohup bash examples/qapo_trainer/run_alfworld.sh > ./log/test_qapo_200_128_1.5b_s3_3_G10S10T10_w0-1-02_woAP.log 2>&1 &
+# nohup bash examples/qapo_trainer/run_alfworld.sh > ./log/test_qapo_200_128_1.5b_s3_1_S10_w11.log 2>&1 &
 python3 -m examples.data_preprocess.prepare \
     --mode 'text' \
     --train_data_size $train_data_size \
@@ -42,7 +42,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=32 \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
     actor_rollout_ref.rollout.name=$ENGINE \
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.45 \
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.6 \
     actor_rollout_ref.rollout.enable_chunked_prefill=False \
     actor_rollout_ref.rollout.enforce_eager=False \
     actor_rollout_ref.rollout.free_cache_engine=False \
@@ -53,6 +53,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.use_invalid_action_penalty=True \
     actor_rollout_ref.actor.invalid_action_penalty_coef=0.1 \
     actor_rollout_ref.novelty_module.enable=True \
+    actor_rollout_ref.novelty_module.mix_adv_type=grpo1_s1_t1 \
     algorithm.use_kl_in_reward=False \
     env.env_name=alfworld/AlfredTWEnv \
     env.seed=3 \
@@ -62,7 +63,7 @@ python3 -m verl.trainer.main_ppo \
     trainer.critic_warmup=0 \
     trainer.logger=['console','wandb'] \
     trainer.project_name='verl_agent_alfworld' \
-    trainer.experiment_name='qapo_qwen2.5_1.5b_s3_1_S10T10_w1' \
+    trainer.experiment_name='qapo_qwen2.5_1.5b_s3_1_w0-2-02_woAP_75decay002_S10T10' \
     trainer.n_gpus_per_node=1 \
     trainer.nnodes=1 \
     trainer.save_freq=-1 \
