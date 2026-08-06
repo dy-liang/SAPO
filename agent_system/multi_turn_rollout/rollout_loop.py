@@ -21,7 +21,7 @@ from verl.utils.model import compute_position_id_with_mask
 import verl.utils.torch_functional as verl_F
 from transformers import PreTrainedTokenizer
 import uuid
-from agent_system.multi_turn_rollout.utils import process_image, to_list_of_dict, torch_to_numpy, filter_group_data
+from agent_system.multi_turn_rollout.utils import compute_discounted_returns, process_image, to_list_of_dict, torch_to_numpy, filter_group_data
 from agent_system.environments import EnvironmentManagerBase
 from typing import List, Dict
 from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
@@ -260,21 +260,26 @@ class TrajectoryCollector:
         
         effective_batch = []
         for bs in range(batch_size):
-            # sum the rewards for each data in total_batch_list[bs]
-            for data in total_batch_list[bs]:
-                assert traj_uid[bs] == data['traj_uid'], "data is not from the same trajectory"
-                if data['active_masks']:
-                    # episode_rewards
-                    data['episode_rewards'] = episode_rewards[bs]
-                    # episode_lengths
-                    data['episode_lengths'] = episode_lengths[bs]
-                    # tool_callings
-                    data['tool_callings'] = tool_callings[bs]
-                    # success_rate
-                    for key, value in success_rate.items():
-                        data[key] = value
+            active_steps = [data for data in total_batch_list[bs] if data['active_masks']]
+            step_rewards = [float(data['env_reward'].item()) for data in active_steps]
+            mc_returns = compute_discounted_returns(step_rewards, gamma=float(self.config.algorithm.gamma))
 
-                    effective_batch.append(data)
+            # Attach trajectory-level metadata and the return before adjust_batch
+            # duplicates rows or the trainer balances/shuffles the batch.
+            for data, mc_return in zip(active_steps, mc_returns):
+                assert traj_uid[bs] == data['traj_uid'], "data is not from the same trajectory"
+                data['mc_return'] = torch.tensor(mc_return, dtype=torch.float32)
+                # episode_rewards
+                data['episode_rewards'] = episode_rewards[bs]
+                # episode_lengths
+                data['episode_lengths'] = episode_lengths[bs]
+                # tool_callings
+                data['tool_callings'] = tool_callings[bs]
+                # success_rate
+                for key, value in success_rate.items():
+                    data[key] = value
+
+                effective_batch.append(data)
             
         # Convert trajectory data to DataProto format
         gen_batch_output = DataProto.from_single_dict(
@@ -384,6 +389,14 @@ class TrajectoryCollector:
             episode_lengths[active_masks] += 1
 
             assert len(rewards) == batch_size, f"env should return rewards for all environments, got {len(rewards)} rewards for {batch_size} environments"
+            reward_values = torch.as_tensor(
+                torch_to_numpy(rewards), dtype=torch.float32, device=batch.batch['input_ids'].device
+            )
+            batch.batch['env_reward'] = reward_values
+            batch.batch['turn_index'] = torch.full(
+                (batch_size,), _step, dtype=torch.long, device=batch.batch['input_ids'].device
+            )
+            batch.batch['done'] = torch.as_tensor(dones, dtype=torch.bool, device=batch.batch['input_ids'].device)
             batch.non_tensor_batch['rewards'] = torch_to_numpy(rewards, is_object=True)
             batch.non_tensor_batch['active_masks'] = torch_to_numpy(active_masks, is_object=True)
             

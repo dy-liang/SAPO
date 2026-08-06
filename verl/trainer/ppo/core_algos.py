@@ -109,6 +109,112 @@ def compute_gae_advantage_return(
     return advantages, returns
 
 
+def compute_arq_mixing_coefficient(
+    global_step: int,
+    total_training_steps: int,
+    warmup_ratio: float,
+    start: float = 0.0,
+    end: float = 1.0,
+) -> float:
+    """Linear MC-to-Q advantage schedule used by ARQ-PPO."""
+    if total_training_steps <= 0:
+        raise ValueError(f"total_training_steps must be positive, got {total_training_steps}")
+    if warmup_ratio < 0:
+        raise ValueError(f"warmup_ratio must be non-negative, got {warmup_ratio}")
+    warmup_steps = max(int(total_training_steps * warmup_ratio), 1)
+    progress = min(max((global_step - 1) / warmup_steps, 0.0), 1.0)
+    return float(start + progress * (end - start))
+
+
+def compute_arq_turn_advantage(
+    mc_returns: torch.Tensor,
+    old_v_values: torch.Tensor,
+    old_q_values: torch.Tensor,
+    response_mask: torch.Tensor,
+    alpha: float,
+    invalid_action_mask: torch.Tensor | None = None,
+    invalid_action_penalty_coef: float = 0.0,
+    unique_turn_mask: torch.Tensor | None = None,
+    normalize: bool = True,
+    epsilon: float = 1e-6,
+) -> dict[str, torch.Tensor]:
+    """Compute detached scalar ARQ advantages, then broadcast over tokens.
+
+    Whitening statistics are computed once per unique trajectory/turn.  This
+    prevents random padding copies added by ``adjust_batch`` from changing the
+    advantage scale.
+    """
+    if mc_returns.ndim != 1 or old_v_values.ndim != 1 or old_q_values.ndim != 1:
+        raise ValueError("ARQ returns, V, and Q must be one-dimensional turn tensors")
+    if not (mc_returns.shape == old_v_values.shape == old_q_values.shape):
+        raise ValueError("ARQ returns, V, and Q must have identical shapes")
+    if response_mask.ndim != 2 or response_mask.shape[0] != mc_returns.shape[0]:
+        raise ValueError("ARQ response_mask must have shape [turns, response_length]")
+
+    with torch.no_grad():
+        mc_returns = mc_returns.detach().to(torch.float32)
+        old_v_values = old_v_values.detach().to(torch.float32)
+        old_q_values = old_q_values.detach().to(torch.float32)
+        advantage_mc = mc_returns - old_v_values
+        advantage_q = old_q_values - old_v_values
+        raw_advantage = (1.0 - alpha) * advantage_mc + alpha * advantage_q
+
+        if invalid_action_mask is not None:
+            invalid_action_mask = invalid_action_mask.to(device=raw_advantage.device, dtype=raw_advantage.dtype)
+            raw_advantage = raw_advantage - invalid_action_penalty_coef * invalid_action_mask
+
+        if unique_turn_mask is None:
+            unique_turn_mask = torch.ones_like(raw_advantage, dtype=torch.bool)
+        else:
+            unique_turn_mask = unique_turn_mask.to(device=raw_advantage.device, dtype=torch.bool)
+        if unique_turn_mask.shape != raw_advantage.shape or not torch.any(unique_turn_mask):
+            raise ValueError("unique_turn_mask must select at least one ARQ turn")
+
+        normalized_advantage = raw_advantage
+        if normalize:
+            stats_values = raw_advantage[unique_turn_mask]
+            mean = stats_values.mean()
+            variance = stats_values.var(unbiased=False)
+            normalized_advantage = (raw_advantage - mean) * torch.rsqrt(variance + epsilon)
+
+        token_advantage = normalized_advantage.unsqueeze(-1) * response_mask
+        token_returns = mc_returns.unsqueeze(-1) * response_mask
+
+    return {
+        "advantages": token_advantage,
+        "returns": token_returns,
+        "turn_advantages": normalized_advantage,
+        "raw_turn_advantages": raw_advantage,
+        "mc_advantages": advantage_mc,
+        "q_advantages": advantage_q,
+    }
+
+
+def compute_arq_value_loss(
+    current_probs: torch.Tensor,
+    old_probs: torch.Tensor,
+    target_probs: torch.Tensor,
+    cliprange: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Turn-level PPO-style clipped regression loss for bounded V or Q."""
+    if current_probs.ndim != 1 or old_probs.ndim != 1 or target_probs.ndim != 1:
+        raise ValueError("ARQ value loss expects one scalar per turn")
+    if not (current_probs.shape == old_probs.shape == target_probs.shape):
+        raise ValueError("ARQ current, old, and target probabilities must have identical shapes")
+    if cliprange < 0:
+        raise ValueError(f"cliprange must be non-negative, got {cliprange}")
+
+    old_probs = old_probs.detach().to(torch.float32)
+    target_probs = target_probs.detach().to(torch.float32)
+    current_probs = current_probs.to(torch.float32)
+    clipped_probs = old_probs + torch.clamp(current_probs - old_probs, -cliprange, cliprange)
+    loss_unclipped = (current_probs - target_probs).square()
+    loss_clipped = (clipped_probs - target_probs).square()
+    loss = 0.5 * torch.maximum(loss_unclipped, loss_clipped).mean()
+    clip_fraction = (torch.abs(current_probs - old_probs) > cliprange).to(torch.float32).mean()
+    return loss, clip_fraction
+
+
 # NOTE(sgm): this implementation only consider outcome supervision, where the reward is a scalar.
 def compute_grpo_outcome_advantage(
     token_level_rewards: torch.Tensor,

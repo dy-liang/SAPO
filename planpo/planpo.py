@@ -127,7 +127,7 @@ def linear_decay(epoch, start_epoch=0, end_epoch=150, start_value=1.0, end_value
     progress = (epoch - start_epoch) / (end_epoch - start_epoch)
     return start_value + progress * (end_value - start_value)
 
-def compute_qapo_outcome_advantage(
+def compute_planpo_outcome_advantage(
     token_level_rewards: torch.Tensor,
     step_level_len_rewards: torch.Tensor,
     token_level_len_rewards: torch.Tensor,

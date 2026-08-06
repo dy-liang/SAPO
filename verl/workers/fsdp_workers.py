@@ -24,7 +24,7 @@ import psutil
 import torch
 import torch.distributed
 from codetiming import Timer
-from omegaconf import DictConfig, open_dict
+from omegaconf import DictConfig, OmegaConf, open_dict
 from torch.distributed.device_mesh import init_device_mesh
 
 import verl.utils.torch_functional as verl_F
@@ -502,6 +502,41 @@ class ActorRolloutRefWorker(Worker):
 
         return rollout, rollout_sharding_manager
 
+    def _configure_arq(self):
+        """Resolve ARQ tokens once and pass an isolated config to actor/ref/rollout."""
+        arq_config = self.config.get("arq", None)
+        if arq_config is None or not arq_config.get("enable", False):
+            return
+
+        from verl.trainer.ppo.arq import resolve_value_tokens
+
+        resolved = resolve_value_tokens(self.tokenizer, arq_config)
+        with open_dict(self.config.arq):
+            for key, value in resolved.items():
+                self.config.arq[key] = value
+
+        resolved_config = OmegaConf.create(OmegaConf.to_container(self.config.arq, resolve=True))
+        with open_dict(self.config.actor):
+            self.config.actor.arq = resolved_config
+        with open_dict(self.config.ref):
+            self.config.ref.arq = OmegaConf.create(OmegaConf.to_container(resolved_config, resolve=True))
+
+        # Do not use vLLM's string-based bad_words processor here.  It can
+        # make large batched rollouts dramatically slower.  The rollout
+        # wrapper converts these IDs to a two-entry native logit_bias map.
+        with open_dict(self.config.rollout):
+            self.config.rollout.arq_excluded_token_ids = [
+                resolved["positive_token_id"],
+                resolved["negative_token_id"],
+            ]
+
+        if self.rank == 0:
+            print(
+                "ARQ value tokens resolved: "
+                f"positive={resolved['positive_token']!r}/{resolved['positive_token_id']}, "
+                f"negative={resolved['negative_token']!r}/{resolved['negative_token_id']}"
+            )
+
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def init_model(self):
         from verl.workers.actor import DataParallelPPOActor
@@ -557,6 +592,7 @@ class ActorRolloutRefWorker(Worker):
             if self._is_offload_optimizer:
                 offload_fsdp_optimizer(optimizer=self.actor_optimizer)
                 log_gpu_memory_usage("After offload actor optimizer during init", logger=logger)
+            self._configure_arq()
         # load from checkpoint
         if self._is_actor:
             OmegaConf.set_struct(self.config.actor, True)
@@ -584,6 +620,7 @@ class ActorRolloutRefWorker(Worker):
                 use_liger=self.config.model.get("use_liger", False),
                 role="ref",
             )[0]
+            self._configure_arq()
             OmegaConf.set_struct(self.config.ref, True)
             with open_dict(self.config.ref):
                 self.config.ref.use_remove_padding = use_remove_padding
@@ -697,9 +734,32 @@ class ActorRolloutRefWorker(Worker):
         with self.ulysses_sharding_manager:
             data = self.ulysses_sharding_manager.preprocess_data(data)
             with adapter_ctx:
-                output, entropys, _ = self.actor.compute_log_prob(data=data, calculate_entropy=True, calculate_nov=False)
+                calculate_arq = self.config.get("arq", {}).get("enable", False)
+                log_prob_outputs = self.actor.compute_log_prob(
+                        data=data,
+                        calculate_entropy=True,
+                        calculate_nov=False,
+                        calculate_arq=calculate_arq,
+                    )
+                if calculate_arq:
+                    output, entropys, _, arq_outputs = log_prob_outputs
+                else:
+                    output, entropys, _ = log_prob_outputs
+                    arq_outputs = None
+            output_tensors = {"old_log_probs": output, "entropys": entropys}
+            if calculate_arq:
+                output_tensors.update(
+                    {
+                        "old_v_probs": arq_outputs["v_probs"],
+                        "old_q_probs": arq_outputs["q_probs"],
+                        "old_v_values": arq_outputs["v_values"],
+                        "old_q_values": arq_outputs["q_values"],
+                        "old_v_logit_gaps": arq_outputs["v_logit_gaps"],
+                        "old_q_logit_gaps": arq_outputs["q_logit_gaps"],
+                    }
+                )
             output = DataProto.from_dict(
-                tensors={"old_log_probs": output, "entropys": entropys}, #, "action_novelty": action_novelty
+                tensors=output_tensors,
                 meta_info={"temperature": self.config.rollout.temperature},
             )
             output = self.ulysses_sharding_manager.postprocess_data(output)

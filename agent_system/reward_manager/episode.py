@@ -96,7 +96,6 @@ class EpisodeRewardManager:
 
             episode_rewards = data_item.non_tensor_batch['episode_rewards']
 
-            episode_lengths = data_item.non_tensor_batch['episode_lengths']
 
             if self.normalize_by_length:
                 score = episode_rewards / episode_lengths
@@ -105,7 +104,6 @@ class EpisodeRewardManager:
             reward_tensor[i, valid_response_length - 1] = torch.tensor(score, dtype=torch.float32, device=prompt_ids.device)
             len_reward_tensor[i, valid_response_length - 1] = torch.tensor(len_episode_rewards, dtype=torch.float32, device=prompt_ids.device)
             token_len_reward_tensor[i, valid_response_length - 1] = torch.tensor(token_len_rewards, dtype=torch.float32, device=prompt_ids.device)
-
             if data_source not in already_print_data_sources:
                 already_print_data_sources[data_source] = 0
 

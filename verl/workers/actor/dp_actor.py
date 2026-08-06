@@ -30,7 +30,13 @@ from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
 import verl.utils.torch_functional as verl_F
 from verl import DataProto
-from verl.trainer.ppo.core_algos import agg_loss, compute_policy_loss, compute_policy_loss_gspo, kl_penalty
+from verl.trainer.ppo.arq import (
+    get_arq_boundary_positions,
+    masked_policy_logprobs_and_entropy,
+    padded_positions_to_unpadded_indices,
+    value_outputs_from_logits,
+)
+from verl.trainer.ppo.core_algos import agg_loss, compute_arq_value_loss, compute_policy_loss, compute_policy_loss_gspo, kl_penalty
 from verl.utils.debug import GPUMemoryLogger
 from verl.utils.device import get_device_name, get_torch_device, is_cuda_available, is_npu_available
 from verl.utils.fsdp_utils import FSDPModule, fsdp2_clip_grad_norm_
@@ -108,7 +114,56 @@ class DataParallelPPOActor(BasePPOActor):
         )
         self.device_name = get_device_name()
 
-    def _forward_micro_batch(self, micro_batch, temperature, calculate_entropy=False, calculate_nov=False) -> Tuple[torch.Tensor, torch.Tensor]:
+        self.arq_config = self.config.get("arq", None)
+        self.arq_enabled = self.arq_config is not None and self.arq_config.get("enable", False)
+        self.arq_token_ids = ()
+        if self.arq_enabled:
+            self.arq_token_ids = (
+                int(self.arq_config.positive_token_id),
+                int(self.arq_config.negative_token_id),
+            )
+            if self.use_fused_kernels:
+                raise ValueError("ARQ-PPO v1 does not support fused actor kernels")
+            if self.use_ulysses_sp:
+                raise ValueError("ARQ-PPO v1 does not support Ulysses sequence parallelism")
+
+    def _extract_arq_outputs(self, raw_logits, attention_mask, response_length, unpad_indices=None):
+        """Extract bounded V/Q scalars from raw next-token logits."""
+        v_positions, q_positions = get_arq_boundary_positions(attention_mask, response_length)
+        if unpad_indices is not None:
+            sequence_length = attention_mask.shape[1]
+            v_indices = padded_positions_to_unpadded_indices(v_positions, unpad_indices, sequence_length)
+            q_indices = padded_positions_to_unpadded_indices(q_positions, unpad_indices, sequence_length)
+            v_logits = raw_logits[v_indices]
+            q_logits = raw_logits[q_indices]
+        else:
+            batch_indices = torch.arange(raw_logits.shape[0], device=raw_logits.device)
+            v_logits = raw_logits[batch_indices, v_positions]
+            q_logits = raw_logits[batch_indices, q_positions]
+
+        positive_id, negative_id = self.arq_token_ids
+        v_output = value_outputs_from_logits(
+            v_logits[:, positive_id],
+            v_logits[:, negative_id],
+            value_temperature=float(self.arq_config.value_temperature),
+            reward_max=float(self.arq_config.reward_max),
+        )
+        q_output = value_outputs_from_logits(
+            q_logits[:, positive_id],
+            q_logits[:, negative_id],
+            value_temperature=float(self.arq_config.value_temperature),
+            reward_max=float(self.arq_config.reward_max),
+        )
+        return {
+            "v_probs": v_output["probs"],
+            "q_probs": q_output["probs"],
+            "v_values": v_output["values"],
+            "q_values": q_output["values"],
+            "v_logit_gaps": v_output["logit_gaps"],
+            "q_logit_gaps": q_output["logit_gaps"],
+        }
+
+    def _forward_micro_batch(self, micro_batch, temperature, calculate_entropy=False, calculate_nov=False, calculate_arq=False) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Returns:
             entropy: # (bs, response_len)
@@ -126,6 +181,8 @@ class DataParallelPPOActor(BasePPOActor):
             attention_mask = micro_batch["attention_mask"]
             position_ids = micro_batch["position_ids"]
             entropy = None
+            action_novelty = None
+            arq_outputs = None
             if position_ids.dim() == 3:  # qwen2vl mrope
                 position_ids = position_ids.transpose(0, 1)  # (bsz, 4, seqlen) -> (4, bsz, seqlen)
 
@@ -186,21 +243,37 @@ class DataParallelPPOActor(BasePPOActor):
                     entropy_rmpad = output.entropy.squeeze(0)  # (total_nnz,)
                 else:
                     logits_rmpad = output.logits.squeeze(0)  # (total_nnz, vocab_size)
-                    logits_rmpad.div_(temperature)
+                    if self.arq_enabled and calculate_arq:
+                        arq_outputs = self._extract_arq_outputs(
+                            raw_logits=logits_rmpad,
+                            attention_mask=attention_mask,
+                            response_length=response_length,
+                            unpad_indices=indices,
+                        )
+                    # V/Q were gathered from raw logits above.  Reuse the same
+                    # storage for policy-temperature scaling to avoid another
+                    # [tokens, vocab] allocation.
+                    policy_logits_rmpad = logits_rmpad.div_(temperature)
 
                     # if use_sp: ((total_nnz / sp) + pad) ; if not use_sp: (batch, seqlen)
-                    inplace_backward = True
-                    if calculate_entropy:
-                        inplace_backward = False
-                    log_probs = logprobs_from_logits(
-                        logits=logits_rmpad,
-                        labels=input_ids_rmpad_rolled,
-                        inplace_backward=inplace_backward,
-                    )
+                    if self.arq_enabled:
+                        log_probs, entropy_rmpad = masked_policy_logprobs_and_entropy(
+                            logits=policy_logits_rmpad,
+                            labels=input_ids_rmpad_rolled,
+                            excluded_token_ids=self.arq_token_ids,
+                            calculate_entropy=calculate_entropy,
+                        )
+                    else:
+                        inplace_backward = not calculate_entropy
+                        log_probs = logprobs_from_logits(
+                            logits=policy_logits_rmpad,
+                            labels=input_ids_rmpad_rolled,
+                            inplace_backward=inplace_backward,
+                        )
 
-                    # compute entropy
-                    if calculate_entropy:
-                        entropy_rmpad = self.compute_entropy_from_logits(logits_rmpad)  # ((total_nnz / sp) + pad)
+                        # compute entropy
+                        if calculate_entropy:
+                            entropy_rmpad = self.compute_entropy_from_logits(policy_logits_rmpad)  # ((total_nnz / sp) + pad)
 
                 # gather log_prob if sp > 1
                 if self.use_ulysses_sp:
@@ -232,13 +305,6 @@ class DataParallelPPOActor(BasePPOActor):
                     batch=batch_size,
                     seqlen=seqlen,
                 )
-                full_logits = pad_input(
-                    hidden_states=logits_rmpad,
-                    indices=indices,
-                    batch=batch_size,
-                    seqlen=seqlen,
-                )
-
                 # only return response part:
                 if calculate_entropy:
                     entropy = full_entropy.squeeze(-1)[:, -response_length - 1 : -1]  # (bsz, response_length)
@@ -287,14 +353,31 @@ class DataParallelPPOActor(BasePPOActor):
                     entropy = output.entropy[:, -response_length - 1 : -1]  # (bsz, response_length)
 
                 else:
-                    logits = output.logits
+                    raw_logits = output.logits
+                    if self.arq_enabled and calculate_arq:
+                        arq_outputs = self._extract_arq_outputs(
+                            raw_logits=raw_logits,
+                            attention_mask=attention_mask,
+                            response_length=response_length,
+                        )
+                    # Boundary values have already been copied out of the raw
+                    # tensor, so policy scaling can safely reuse logits storage.
+                    policy_logits = raw_logits.div_(temperature)
+                    response_logits = policy_logits[:, -response_length - 1 : -1, :]
+                    if self.arq_enabled:
+                        log_probs, entropy = masked_policy_logprobs_and_entropy(
+                            logits=response_logits,
+                            labels=micro_batch["responses"],
+                            excluded_token_ids=self.arq_token_ids,
+                            calculate_entropy=calculate_entropy,
+                        )
+                    else:
+                        log_probs = logprobs_from_logits(response_logits, micro_batch["responses"])
+                        if calculate_entropy:
+                            entropy = verl_F.entropy_from_logits(response_logits)  # (bsz, response_length)
 
-                    logits.div_(temperature)
-                    logits = logits[:, -response_length - 1 : -1, :]  # (bsz, response_length, vocab_size)
-                    log_probs = logprobs_from_logits(logits, micro_batch["responses"])
-                    if calculate_entropy:
-                        entropy = verl_F.entropy_from_logits(logits)  # (bsz, response_length)
-
+            if calculate_arq:
+                return entropy, log_probs, action_novelty, arq_outputs
             return entropy, log_probs, action_novelty
 
     def _optimizer_step(self):
@@ -316,7 +399,7 @@ class DataParallelPPOActor(BasePPOActor):
         return grad_norm
 
     @GPUMemoryLogger(role="dp actor", logger=logger)
-    def compute_log_prob(self, data: DataProto, calculate_entropy=False, calculate_nov=False) -> torch.Tensor:
+    def compute_log_prob(self, data: DataProto, calculate_entropy=False, calculate_nov=False, calculate_arq=False) -> torch.Tensor:
         """Compute the log probability of the responses given input_ids, attention_mask and position_ids
 
         Args:
@@ -359,16 +442,40 @@ class DataParallelPPOActor(BasePPOActor):
         log_probs_lst = []
         entropy_lst = []
         action_novelty_lst = []
+        arq_output_lists = {
+            "v_probs": [],
+            "q_probs": [],
+            "v_values": [],
+            "q_values": [],
+            "v_logit_gaps": [],
+            "q_logit_gaps": [],
+        }
         for micro_batch in micro_batches:
             if isinstance(micro_batch, DataProto):
                 micro_batch = {**micro_batch.batch, **micro_batch.non_tensor_batch}
             with torch.no_grad():
-                entropy, log_probs, action_novelty = self._forward_micro_batch(micro_batch, temperature=temperature, calculate_entropy=calculate_entropy, calculate_nov=calculate_nov)
+                forward_outputs = self._forward_micro_batch(
+                    micro_batch,
+                    temperature=temperature,
+                    calculate_entropy=calculate_entropy,
+                    calculate_nov=calculate_nov,
+                    calculate_arq=calculate_arq,
+                )
+                if calculate_arq:
+                    entropy, log_probs, action_novelty, arq_outputs = forward_outputs
+                else:
+                    entropy, log_probs, action_novelty = forward_outputs
+                    arq_outputs = None
             log_probs_lst.append(log_probs)
             if calculate_entropy:
                 entropy_lst.append(entropy)
             if calculate_nov:
                 action_novelty_lst.append(action_novelty)
+            if calculate_arq:
+                if arq_outputs is None:
+                    raise RuntimeError("ARQ values were requested but the actor did not return them")
+                for key, value in arq_outputs.items():
+                    arq_output_lists[key].append(value)
 
         log_probs = torch.concat(log_probs_lst, dim=0)
         entropys = None
@@ -377,12 +484,19 @@ class DataParallelPPOActor(BasePPOActor):
         action_novelties = None
         if calculate_nov:
             action_novelties = torch.concat(action_novelty_lst, dim=0)
+        concatenated_arq_outputs = None
+        if calculate_arq:
+            concatenated_arq_outputs = {
+                key: torch.concat(values, dim=0) for key, values in arq_output_lists.items()
+            }
         if use_dynamic_bsz:
             indices = list(itertools.chain.from_iterable(indices))
             assert len(indices) == log_probs.size(0), f"{len(indices)} vs. {log_probs.size()}"
             revert_indices = torch.tensor(get_reverse_idx(indices), dtype=torch.long)
             log_probs = log_probs[revert_indices]
 
+        if calculate_arq:
+            return log_probs, entropys, action_novelties, concatenated_arq_outputs
         return log_probs, entropys, action_novelties
 
     @GPUMemoryLogger(role="dp actor", logger=logger)
@@ -394,6 +508,8 @@ class DataParallelPPOActor(BasePPOActor):
         multi_turn = data.meta_info.get("multi_turn", False)
 
         select_keys = ["responses", "input_ids", "attention_mask", "position_ids", "old_log_probs", "advantages"]
+        if self.arq_enabled:
+            select_keys.extend(["old_v_probs", "old_q_probs", "mc_return"])
         if multi_turn:
             select_keys.append("loss_mask")
         if self.config.use_kl_loss:
@@ -457,7 +573,18 @@ class DataParallelPPOActor(BasePPOActor):
                     calculate_entropy = False
                     if entropy_coeff != 0:
                         calculate_entropy = True
-                    entropy, log_prob, _ = self._forward_micro_batch(micro_batch=data, temperature=temperature, calculate_entropy=calculate_entropy, calculate_nov=False)
+                    forward_outputs = self._forward_micro_batch(
+                            micro_batch=data,
+                            temperature=temperature,
+                            calculate_entropy=calculate_entropy,
+                            calculate_nov=False,
+                            calculate_arq=self.arq_enabled,
+                        )
+                    if self.arq_enabled:
+                        entropy, log_prob, _, arq_outputs = forward_outputs
+                    else:
+                        entropy, log_prob, _ = forward_outputs
+                        arq_outputs = None
                     
                     loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
                     if loss_mode == "vanilla":
@@ -496,6 +623,48 @@ class DataParallelPPOActor(BasePPOActor):
                         policy_loss = policy_loss + kl_loss * self.config.kl_loss_coef
                         metrics["actor/kl_loss"] = kl_loss.detach().item()
                         metrics["actor/kl_coef"] = self.config.kl_loss_coef
+
+                    if self.arq_enabled:
+                        if arq_outputs is None:
+                            raise RuntimeError("ARQ actor update requires current V/Q outputs")
+                        target_probs = torch.clamp(
+                            data["mc_return"].to(torch.float32) / float(self.arq_config.reward_max),
+                            min=0.0,
+                            max=1.0,
+                        )
+                        value_loss, value_clipfrac = compute_arq_value_loss(
+                            current_probs=arq_outputs["v_probs"],
+                            old_probs=data["old_v_probs"],
+                            target_probs=target_probs,
+                            cliprange=float(self.arq_config.value_cliprange),
+                        )
+                        q_loss, q_clipfrac = compute_arq_value_loss(
+                            current_probs=arq_outputs["q_probs"],
+                            old_probs=data["old_q_probs"],
+                            target_probs=target_probs,
+                            cliprange=float(self.arq_config.q_cliprange),
+                        )
+                        policy_loss = (
+                            policy_loss
+                            + float(self.arq_config.value_loss_coef) * value_loss
+                            + float(self.arq_config.q_loss_coef) * q_loss
+                        )
+                        append_to_dict(
+                            metrics,
+                            {
+                                "arq/value_loss": value_loss.detach().item(),
+                                "arq/q_loss": q_loss.detach().item(),
+                                "arq/value_clipfrac": value_clipfrac.detach().item(),
+                                "arq/q_clipfrac": q_clipfrac.detach().item(),
+                                "arq/current_v_prob_mean": arq_outputs["v_probs"].detach().mean().item(),
+                                "arq/current_q_prob_mean": arq_outputs["q_probs"].detach().mean().item(),
+                                "arq/current_q_minus_v_mean": (
+                                    arq_outputs["q_values"] - arq_outputs["v_values"]
+                                ).detach().mean().item(),
+                                "arq/v_logit_gap_mean": arq_outputs["v_logit_gaps"].detach().mean().item(),
+                                "arq/q_logit_gap_mean": arq_outputs["q_logit_gaps"].detach().mean().item(),
+                            },
+                        )
 
                     if self.config.use_dynamic_bsz:
                         # relative to the dynamic bsz

@@ -206,6 +206,54 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> Dict[str,
         #     batch.non_tensor_batch["tool_callings"][unique_idx].min().item(),
         **({f"episode/{k}": v[0].item() for k, v in batch.non_tensor_batch.items() if "success_rate" in k}),
     }
+
+    if {"old_v_values", "old_q_values", "old_v_probs", "old_q_probs", "mc_return"}.issubset(batch.batch.keys()):
+        old_v = batch.batch["old_v_values"].to(torch.float32)
+        old_q = batch.batch["old_q_values"].to(torch.float32)
+        old_v_prob = batch.batch["old_v_probs"].to(torch.float32)
+        old_q_prob = batch.batch["old_q_probs"].to(torch.float32)
+        mc_return = batch.batch["mc_return"].to(torch.float32)
+        q_minus_v = old_q - old_v
+        return_variance = torch.var(mc_return, unbiased=False)
+        v_residual_variance = torch.var(mc_return - old_v, unbiased=False)
+        q_residual_variance = torch.var(mc_return - old_q, unbiased=False)
+        centered_return = mc_return - mc_return.mean()
+        centered_v = old_v - old_v.mean()
+        centered_q = old_q - old_q.mean()
+        v_correlation = (centered_return * centered_v).mean() / (
+            centered_return.std(unbiased=False) * centered_v.std(unbiased=False) + 1e-6
+        )
+        q_correlation = (centered_return * centered_q).mean() / (
+            centered_return.std(unbiased=False) * centered_q.std(unbiased=False) + 1e-6
+        )
+        target_prob = batch.batch.get("arq_target_probs")
+        if target_prob is None:
+            target_prob = torch.clamp(mc_return, min=0.0, max=1.0)
+        target_prob = target_prob.to(torch.float32)
+        metrics.update(
+            {
+                "arq/old_v_value_mean": old_v.mean().detach().item(),
+                "arq/old_v_value_std": old_v.std(unbiased=False).detach().item(),
+                "arq/old_q_value_mean": old_q.mean().detach().item(),
+                "arq/old_q_value_std": old_q.std(unbiased=False).detach().item(),
+                "arq/old_v_prob_min": old_v_prob.min().detach().item(),
+                "arq/old_v_prob_max": old_v_prob.max().detach().item(),
+                "arq/old_q_prob_min": old_q_prob.min().detach().item(),
+                "arq/old_q_prob_max": old_q_prob.max().detach().item(),
+                "arq/q_minus_v_mean": q_minus_v.mean().detach().item(),
+                "arq/q_minus_v_std": q_minus_v.std(unbiased=False).detach().item(),
+                "arq/q_v_near_collapse_ratio": (q_minus_v.abs() < 1e-3).float().mean().detach().item(),
+                "arq/v_explained_variance": (1.0 - v_residual_variance / (return_variance + 1e-5)).detach().item(),
+                "arq/q_explained_variance": (1.0 - q_residual_variance / (return_variance + 1e-5)).detach().item(),
+                "arq/v_return_correlation": v_correlation.detach().item(),
+                "arq/q_return_correlation": q_correlation.detach().item(),
+                "arq/v_brier": (old_v_prob - target_prob).square().mean().detach().item(),
+                "arq/q_brier": (old_q_prob - target_prob).square().mean().detach().item(),
+                "arq/mc_return_mean": mc_return.mean().detach().item(),
+            }
+        )
+        if "arq_alpha" in batch.batch:
+            metrics["arq/advantage_alpha"] = batch.batch["arq_alpha"].mean().detach().item()
     return metrics
 
 

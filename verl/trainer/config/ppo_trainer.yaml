@@ -242,6 +242,7 @@ algorithm:
   gamma: 1.0
   lam: 1.0
   adv_estimator: gae
+  token_weight: 0.2
   norm_adv_by_std_in_grpo: True
   use_kl_in_reward: False
   kl_penalty: kl  # how to estimate kl divergence
@@ -259,6 +260,27 @@ algorithm:
     mode: "mean_norm" # "mean_norm" or "mean_std_norm"
     enable_similarity: False # whether to use similarity-based anchor state grouping in GiGPO (supported for text-only tasks)
     similarity_thresh: 0.95 # similarity threshold for GiGPO (0.0, 1.0)
+  # Autoregressive Actor-Q PPO. This node is copied into the FSDP actor worker
+  # only when adv_estimator=arq_ppo, so PPO/GRPO defaults are unaffected.
+  arq:
+    enable: False
+    positive_token: null
+    negative_token: null
+    positive_token_id: null
+    negative_token_id: null
+    reward_mode: bounded_outcome
+    reward_max: 10.0
+    value_temperature: 5.0
+    value_cliprange: 0.2
+    q_cliprange: 0.2
+    value_loss_coef: 0.1
+    q_loss_coef: 0.1
+    q_target: monte_carlo
+    advantage_mix_start: 0.0
+    advantage_mix_end: 1.0
+    advantage_warmup_ratio: 0.1
+    normalize_turn_advantage: True
+    exclude_value_tokens_from_policy: True
   filter_groups: # DAPO from https://arxiv.org/abs/2503.14476
     enable: False
     max_num_gen_batches: 10

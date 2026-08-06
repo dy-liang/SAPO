@@ -60,7 +60,7 @@ from verl.utils.torch_functional import masked_mean
 from verl.utils.tracking import ValidationGenerationsLogger
 from verl.workers.rollout.async_server import AsyncLLMServerManager
 from gigpo import core_gigpo
-from qapo import qapo
+from planpo import planpo
 from agent_system.multi_turn_rollout import TrajectoryCollector, adjust_batch
 
 WorkerType = Type[Worker]
@@ -87,13 +87,14 @@ class AdvantageEstimator(str, Enum):
 
     GAE = "gae"
     GRPO = "grpo"
-    QAPO = "qapo"
+    planpo = "planpo"
     REINFORCE_PLUS_PLUS = "reinforce_plus_plus"
     REINFORCE_PLUS_PLUS_BASELINE = "reinforce_plus_plus_baseline"
     REMAX = "remax"
     RLOO = "rloo"
     GRPO_PASSK = "grpo_passk"
     GiGPO = 'gigpo'
+    ARQ_PPO = "arq_ppo"
 
 
 @dataclass
@@ -200,7 +201,7 @@ def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, 
 def apply_invalid_action_penalty(data: DataProto, invalid_action_penalty_coef=float):
     reward_tensor = data.batch['token_level_scores']
     step_level_len_scores = data.batch['step_level_len_scores']
-    #token_level_len_scores = data.batch['token_level_len_scores']
+    token_level_len_scores = data.batch['token_level_len_scores']
 
     if 'step_rewards' in data.batch.keys():
         step_rewards = data.batch['step_rewards']
@@ -219,7 +220,7 @@ def apply_invalid_action_penalty(data: DataProto, invalid_action_penalty_coef=fl
         # assert reward_tensor[i, valid_response_length - 1] != 0.0, f'i={i}'
         reward_tensor[i, valid_response_length - 1] -= invalid_action_penalty_coef * action_invalids
         step_level_len_scores[i, valid_response_length - 1] -= invalid_action_penalty_coef * action_invalids
-        #token_level_len_scores[i, valid_response_length - 1] -= invalid_action_penalty_coef * action_invalids
+        token_level_len_scores[i, valid_response_length - 1] -= invalid_action_penalty_coef * action_invalids
 
         if 'step_rewards' in data.batch.keys():
             step_rewards[i] -= invalid_action_penalty_coef * action_invalids
@@ -246,7 +247,7 @@ def compute_response_mask(data: DataProto):
     return attention_mask[:, -response_length:]
 
 
-def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_repeat=1, multi_turn=False, norm_adv_by_std_in_grpo=True, step_advantage_w=1.0, gigpo_mode="mean_std_norm", gigpo_enable_similarity=False, gigpo_similarity_thresh=0.95, mix_adv_type="grpo1", epoch=None,**kwargs):
+def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_repeat=1, multi_turn=False, norm_adv_by_std_in_grpo=True, step_advantage_w=1.0, gigpo_mode="mean_std_norm", gigpo_enable_similarity=False, gigpo_similarity_thresh=0.95, planpo_advantage_wt=0.2, mix_adv_type="grpo1", epoch=None,**kwargs):
     """Compute advantage estimates for policy optimization.
 
     This function computes advantage estimates using various estimators like GAE, GRPO, REINFORCE++, etc.
@@ -271,7 +272,7 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
     # TODO: add other ways to estimate advantages
     if adv_estimator == AdvantageEstimator.GAE:
         advantages, returns = core_algos.compute_gae_advantage_return(
-            token_level_rewards=data.batch["token_level_rewards"],
+            token_level_rewards=data.batch["ppo_len_shape_rewards"], #data.batch["token_level_rewards"], ppo_len_shape_rewards
             values=data.batch["values"],
             response_mask=data.batch["response_mask"],
             gamma=gamma,
@@ -279,6 +280,9 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
         )
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns
+        data.batch["grpo_advantages"] = advantages
+        data.batch["step_len_advantages"] = advantages
+        data.batch["token_len_advantages"] = advantages
         if kwargs.get("use_pf_ppo", False):
             data = core_algos.compute_pf_ppo_reweight_data(
                 data,
@@ -305,7 +309,7 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
         data.batch["grpo_advantages"] = advantages
         data.batch["step_len_advantages"] = advantages
         data.batch["token_len_advantages"] = advantages
-    elif adv_estimator == AdvantageEstimator.QAPO:
+    elif adv_estimator == AdvantageEstimator.planpo:
         # TODO: test on more adv estimator type
         grpo_calculation_mask = data.batch["response_mask"]
         if multi_turn:
@@ -313,7 +317,7 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
             response_length = grpo_calculation_mask.size(1)  # Get length from the initial response mask
             grpo_calculation_mask = data.batch["loss_mask"][:, -response_length:]  # This mask is the one intended for GRPO
         # Call compute_grpo_outcome_advantage with parameters matching its definition
-        advantages, returns, grpo_advantages, step_len_advantages, token_len_advantages = qapo.compute_qapo_outcome_advantage(
+        advantages, returns, grpo_advantages, step_len_advantages, token_len_advantages = planpo.compute_planpo_outcome_advantage(
             token_level_rewards=data.batch["token_level_rewards"],
             step_level_len_rewards=data.batch["step_level_len_rewards"],
             token_level_len_rewards=data.batch["token_level_len_rewards"],
@@ -322,7 +326,10 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
             traj_index=data.non_tensor_batch['traj_uid'],
             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
             mix_adv_type=mix_adv_type,
-            epoch=epoch
+            epoch=epoch,
+            advantage_wg = 0,
+            advantage_ws = 1.0,
+            advantage_wt = planpo_advantage_wt,
         )
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns
@@ -390,6 +397,60 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
             )
         data.batch['advantages'] = advantages
         data.batch['returns'] = returns
+        data.batch["grpo_advantages"] = advantages
+        data.batch["step_len_advantages"] = advantages
+        data.batch["token_len_advantages"] = advantages
+    elif adv_estimator == AdvantageEstimator.ARQ_PPO:
+        arq_config = kwargs["arq_config"]
+        alpha = core_algos.compute_arq_mixing_coefficient(
+            global_step=int(kwargs["global_step"]),
+            total_training_steps=int(kwargs["total_training_steps"]),
+            warmup_ratio=float(arq_config.advantage_warmup_ratio),
+            start=float(arq_config.advantage_mix_start),
+            end=float(arq_config.advantage_mix_end),
+        )
+
+        turn_indices = data.batch["turn_index"].detach().cpu().tolist()
+        trajectory_ids = data.non_tensor_batch["traj_uid"]
+        seen_turns = set()
+        unique_turn_mask = []
+        for trajectory_id, turn_index in zip(trajectory_ids, turn_indices):
+            turn_key = (str(trajectory_id), int(turn_index))
+            is_unique = turn_key not in seen_turns
+            unique_turn_mask.append(is_unique)
+            seen_turns.add(turn_key)
+        unique_turn_mask = torch.tensor(
+            unique_turn_mask, dtype=torch.bool, device=data.batch["mc_return"].device
+        )
+
+        action_valid = np.asarray(data.non_tensor_batch["is_action_valid"], dtype=bool)
+        invalid_action_mask = torch.as_tensor(
+            np.logical_not(action_valid), dtype=torch.float32, device=data.batch["mc_return"].device
+        )
+        arq_result = core_algos.compute_arq_turn_advantage(
+            mc_returns=data.batch["mc_return"],
+            old_v_values=data.batch["old_v_values"],
+            old_q_values=data.batch["old_q_values"],
+            response_mask=data.batch["response_mask"],
+            alpha=alpha,
+            invalid_action_mask=invalid_action_mask,
+            invalid_action_penalty_coef=float(kwargs.get("invalid_action_penalty_coef", 0.0)),
+            unique_turn_mask=unique_turn_mask,
+            normalize=bool(arq_config.normalize_turn_advantage),
+        )
+        data.batch["advantages"] = arq_result["advantages"]
+        data.batch["returns"] = arq_result["returns"]
+        data.batch["grpo_advantages"] = arq_result["advantages"]
+        data.batch["step_len_advantages"] = arq_result["advantages"]
+        data.batch["token_len_advantages"] = arq_result["advantages"]
+        data.batch["arq_turn_advantages"] = arq_result["turn_advantages"]
+        data.batch["arq_raw_turn_advantages"] = arq_result["raw_turn_advantages"]
+        data.batch["arq_mc_advantages"] = arq_result["mc_advantages"]
+        data.batch["arq_q_advantages"] = arq_result["q_advantages"]
+        data.batch["arq_alpha"] = torch.full_like(data.batch["mc_return"], alpha, dtype=torch.float32)
+        data.batch["arq_target_probs"] = torch.clamp(
+            data.batch["mc_return"].to(torch.float32) / float(arq_config.reward_max), min=0.0, max=1.0
+        )
     else:
         raise NotImplementedError
     return data
@@ -447,6 +508,17 @@ class RayPPOTrainer:
         self.tokenizer = tokenizer
         self.processor = processor
         self.config = config
+        if self.config.algorithm.adv_estimator == AdvantageEstimator.ARQ_PPO:
+            from verl.trainer.ppo.arq import resolve_value_tokens
+
+            resolved_tokens = resolve_value_tokens(self.tokenizer, self.config.algorithm.arq)
+            with open_dict(self.config.algorithm.arq):
+                for key, value in resolved_tokens.items():
+                    self.config.algorithm.arq[key] = value
+            # Workers receive only actor_rollout_ref.  Copy the isolated ARQ
+            # node into that subtree without changing any normal actor fields.
+            with open_dict(self.config.actor_rollout_ref):
+                self.config.actor_rollout_ref.arq = deepcopy(self.config.algorithm.arq)
         self.reward_fn = reward_fn
         self.val_reward_fn = val_reward_fn
         self.envs = envs
@@ -486,7 +558,8 @@ class RayPPOTrainer:
             AdvantageEstimator.RLOO,
             AdvantageEstimator.REINFORCE_PLUS_PLUS_BASELINE,
             AdvantageEstimator.GiGPO,
-            AdvantageEstimator.QAPO
+            AdvantageEstimator.planpo,
+            AdvantageEstimator.ARQ_PPO,
         ]:
             self.use_critic = False
         else:
@@ -605,6 +678,35 @@ class RayPPOTrainer:
         if config.actor_rollout_ref.rollout.multi_turn.enable:
             assert config.actor_rollout_ref.rollout.multi_turn.tool_config_path is not None, "tool_config_path must be set when enabling multi_turn with tool, due to no role-playing support"
             assert config.algorithm.adv_estimator in [AdvantageEstimator.GRPO], "only GRPO is tested for multi-turn with tool"
+
+        if config.algorithm.adv_estimator == AdvantageEstimator.ARQ_PPO:
+            arq = config.algorithm.arq
+            assert arq.enable, "algorithm.arq.enable must be true for arq_ppo"
+            assert config.actor_rollout_ref.actor.strategy in ["fsdp", "fsdp2"], "ARQ-PPO v1 supports FSDP/FSDP2 only"
+            assert config.actor_rollout_ref.rollout.name == "vllm", "ARQ-PPO v1 supports vLLM rollout only"
+            assert config.actor_rollout_ref.rollout.mode == "sync", "ARQ-PPO v1 supports synchronous vLLM rollout only"
+            assert config.actor_rollout_ref.rollout.n == 1, "ARQ-PPO requires actor_rollout_ref.rollout.n=1"
+            assert config.env.rollout.n == 1, "ARQ-PPO v1 requires env.rollout.n=1"
+            assert config.actor_rollout_ref.actor.ppo_epochs == 1, "ARQ-PPO v1 requires ppo_epochs=1"
+            assert config.actor_rollout_ref.actor.ulysses_sequence_parallel_size == 1, "ARQ-PPO v1 does not support Ulysses sequence parallelism"
+            assert not config.actor_rollout_ref.actor.use_dynamic_bsz, "ARQ-PPO v1 does not support dynamic actor batches"
+            assert not config.actor_rollout_ref.model.use_fused_kernels, "ARQ-PPO v1 requires use_fused_kernels=false"
+            assert config.actor_rollout_ref.model.get("lora_rank", 0) == 0, "ARQ-PPO v1 does not support LoRA"
+            assert not config.algorithm.use_kl_in_reward, "ARQ-PPO keeps KL in the policy loss, not the value target"
+            assert arq.reward_mode == "bounded_outcome", "ARQ-PPO v1 supports bounded_outcome rewards only"
+            assert arq.q_target == "monte_carlo", "ARQ-PPO v1 supports Monte Carlo Q targets only"
+            assert arq.reward_max > 0 and arq.value_temperature > 0
+            assert arq.value_loss_coef >= 0 and arq.q_loss_coef >= 0
+            assert 0 <= arq.advantage_warmup_ratio <= 1
+            assert config.actor_rollout_ref.rollout.temperature > 0
+            assert not config.algorithm.filter_groups.enable, "ARQ-PPO v1 does not use group filtering"
+            assert (
+                arq.positive_token is not None or arq.positive_token_id is not None
+            ), "Configure an ARQ positive token or token ID"
+            assert (
+                arq.negative_token is not None or arq.negative_token_id is not None
+            ), "Configure an ARQ negative token or token ID"
+            assert arq.exclude_value_tokens_from_policy, "ARQ value tokens must be excluded from policy support"
 
         print("[validate_config] All configuration checks passed successfully!")
 
@@ -1144,6 +1246,19 @@ class RayPPOTrainer:
                     del batch
                     batch = gen_batch_output
 
+                    if self.config.algorithm.adv_estimator == AdvantageEstimator.ARQ_PPO:
+                        positive_id = int(self.config.algorithm.arq.positive_token_id)
+                        negative_id = int(self.config.algorithm.arq.negative_token_id)
+                        response_mask = compute_response_mask(batch).bool()
+                        sampled_value_token = (
+                            batch.batch["responses"].eq(positive_id)
+                            | batch.batch["responses"].eq(negative_id)
+                        ) & response_mask
+                        if torch.any(sampled_value_token):
+                            raise RuntimeError(
+                                "vLLM sampled an ARQ value token; value tokens must be outside policy support"
+                            )
+
                     batch = adjust_batch(self.config, batch)
 
                     batch.batch["response_mask"] = compute_response_mask(batch)
@@ -1167,8 +1282,8 @@ class RayPPOTrainer:
                         loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
                         entropy_loss = agg_loss(loss_mat=entropys, loss_mask=response_masks, loss_agg_mode=loss_agg_mode)
                         old_log_prob_metrics = {"actor/entropy_loss": entropy_loss.detach().item()}
-                        if self.config.algorithm.adv_estimator == AdvantageEstimator.QAPO: 
-                            step_credits = qapo.compute_step_credits(batch)
+                        if self.config.algorithm.adv_estimator == AdvantageEstimator.planpo or self.config.algorithm.adv_estimator==AdvantageEstimator.GAE: 
+                            step_credits = planpo.compute_step_credits(batch)
                             metrics.update(
                                 {
                                         "training/step_credits_mean": step_credits.detach().mean().item(),
@@ -1213,7 +1328,7 @@ class RayPPOTrainer:
                         if self.config.reward_model.launch_reward_fn_async:
                             future_reward = compute_reward_async.remote(batch, self.config, self.tokenizer)
                         else:
-                            if self.config.algorithm.adv_estimator != AdvantageEstimator.QAPO: 
+                            if self.config.algorithm.adv_estimator != AdvantageEstimator.planpo and self.config.algorithm.adv_estimator!=AdvantageEstimator.GAE: 
                                 step_credits = None
                             reward_tensor, len_reward_tensor, token_len_reward_tensor, reward_extra_infos_dict = compute_reward(batch, step_credits, epoch, self.reward_fn)
 
@@ -1254,10 +1369,20 @@ class RayPPOTrainer:
 
                         # compute rewards. apply_invalid_action_penalty if available
                         if self.config.actor_rollout_ref.actor.get('use_invalid_action_penalty', True):
-                            batch, invalid_metrics = apply_invalid_action_penalty(batch,
-                                                                                  invalid_action_penalty_coef=self.config.actor_rollout_ref.actor.invalid_action_penalty_coef,
-                                                                                  )
-                            metrics.update(invalid_metrics)
+                            if self.config.algorithm.adv_estimator == AdvantageEstimator.ARQ_PPO:
+                                # Keep the Monte Carlo V/Q target equal to the
+                                # environment outcome.  ARQ adds this penalty to
+                                # the scalar policy advantage below.
+                                valid_action_ratio = np.mean(
+                                    batch.non_tensor_batch['is_action_valid'].astype(np.float32)
+                                ).item()
+                                metrics.update({'episode/valid_action_ratio': valid_action_ratio})
+                            else:
+                                batch, invalid_metrics = apply_invalid_action_penalty(
+                                    batch,
+                                    invalid_action_penalty_coef=self.config.actor_rollout_ref.actor.invalid_action_penalty_coef,
+                                )
+                                metrics.update(invalid_metrics)
 
                         # compute rewards. apply_kl_penalty if available
                         if self.config.algorithm.use_kl_in_reward:
@@ -1286,8 +1411,17 @@ class RayPPOTrainer:
                             gigpo_mode=self.config.algorithm.gigpo.mode,
                             gigpo_enable_similarity= self.config.algorithm.gigpo.enable_similarity,
                             gigpo_similarity_thresh=self.config.algorithm.gigpo.similarity_thresh,
+                            planpo_advantage_wt=self.config.algorithm.token_weight,
                             mix_adv_type=self.mix_adv_type,
                             epoch=epoch,
+                            arq_config=self.config.algorithm.arq,
+                            global_step=self.global_steps,
+                            total_training_steps=self.total_training_steps,
+                            invalid_action_penalty_coef=(
+                                self.config.actor_rollout_ref.actor.invalid_action_penalty_coef
+                                if self.config.actor_rollout_ref.actor.get('use_invalid_action_penalty', True)
+                                else 0.0
+                            ),
                         )
 
                     # update critic

@@ -21,6 +21,26 @@ import math
 from PIL import Image
 from verl import DataProto
 
+
+def compute_discounted_returns(rewards, gamma: float = 1.0) -> np.ndarray:
+    """Compute one Monte Carlo return per environment turn.
+
+    This helper operates before batch duplication or sequence-length balancing,
+    so each unique (trajectory, turn) receives exactly one stable target.
+    """
+    if gamma < 0:
+        raise ValueError(f"gamma must be non-negative, got {gamma}")
+    rewards = np.asarray(rewards, dtype=np.float32)
+    if rewards.ndim != 1:
+        raise ValueError(f"rewards must be one-dimensional, got shape {rewards.shape}")
+
+    returns = np.zeros_like(rewards, dtype=np.float32)
+    running_return = 0.0
+    for index in range(len(rewards) - 1, -1, -1):
+        running_return = float(rewards[index]) + gamma * running_return
+        returns[index] = running_return
+    return returns
+
 def to_list_of_dict(batch: DataProto) -> list[dict]:
     tensors = batch.batch
     non_tensor = batch.non_tensor_batch
@@ -182,4 +202,3 @@ def filter_group_data(batch_list : List[Dict],
     tool_callings = tool_callings[keep_indices]
 
     return batch_list, episode_rewards, episode_lengths, success, traj_uid, tool_callings
-

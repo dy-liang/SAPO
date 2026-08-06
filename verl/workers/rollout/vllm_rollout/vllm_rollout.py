@@ -157,6 +157,15 @@ class vLLMRollout(BaseRollout):
         for k in config.keys():
             if hasattr(SamplingParams(), str(k)):
                 kwargs[k] = config.get(k)
+        arq_excluded_token_ids = config.get("arq_excluded_token_ids", None)
+        if arq_excluded_token_ids:
+            if not hasattr(SamplingParams(), "logit_bias"):
+                raise RuntimeError("This vLLM version cannot apply the ARQ token-id sampling mask")
+            # Keep the rollout module importable without loading the trainer
+            # package while vLLM's package-level exports are being initialized.
+            from verl.trainer.ppo.arq import add_arq_rollout_logit_bias
+
+            kwargs = add_arq_rollout_logit_bias(kwargs, arq_excluded_token_ids)
 
         print(f"kwargs: {kwargs}")
         self.sampling_params = SamplingParams(**kwargs)
