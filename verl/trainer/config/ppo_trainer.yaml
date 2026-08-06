@@ -275,10 +275,8 @@ algorithm:
     q_cliprange: 0.2
     value_loss_coef: 0.1
     q_loss_coef: 0.1
-    q_target: monte_carlo
-    advantage_mix_start: 0.0
-    advantage_mix_end: 1.0
-    advantage_warmup_ratio: 0.1
+    advantage_mode: gae
+    q_target: td0
     normalize_turn_advantage: True
     exclude_value_tokens_from_policy: True
   filter_groups: # DAPO from https://arxiv.org/abs/2503.14476

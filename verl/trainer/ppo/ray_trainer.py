@@ -402,40 +402,23 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
         data.batch["token_len_advantages"] = advantages
     elif adv_estimator == AdvantageEstimator.ARQ_PPO:
         arq_config = kwargs["arq_config"]
-        alpha = core_algos.compute_arq_mixing_coefficient(
-            global_step=int(kwargs["global_step"]),
-            total_training_steps=int(kwargs["total_training_steps"]),
-            warmup_ratio=float(arq_config.advantage_warmup_ratio),
-            start=float(arq_config.advantage_mix_start),
-            end=float(arq_config.advantage_mix_end),
-        )
-
-        turn_indices = data.batch["turn_index"].detach().cpu().tolist()
-        trajectory_ids = data.non_tensor_batch["traj_uid"]
-        seen_turns = set()
-        unique_turn_mask = []
-        for trajectory_id, turn_index in zip(trajectory_ids, turn_indices):
-            turn_key = (str(trajectory_id), int(turn_index))
-            is_unique = turn_key not in seen_turns
-            unique_turn_mask.append(is_unique)
-            seen_turns.add(turn_key)
-        unique_turn_mask = torch.tensor(
-            unique_turn_mask, dtype=torch.bool, device=data.batch["mc_return"].device
-        )
-
         action_valid = np.asarray(data.non_tensor_batch["is_action_valid"], dtype=bool)
         invalid_action_mask = torch.as_tensor(
-            np.logical_not(action_valid), dtype=torch.float32, device=data.batch["mc_return"].device
+            np.logical_not(action_valid), dtype=torch.float32, device=data.batch["old_v_values"].device
         )
-        arq_result = core_algos.compute_arq_turn_advantage(
-            mc_returns=data.batch["mc_return"],
+        arq_result = core_algos.compute_arq_gae_targets(
+            rewards=data.batch["env_reward"],
+            dones=data.batch["done"],
             old_v_values=data.batch["old_v_values"],
             old_q_values=data.batch["old_q_values"],
             response_mask=data.batch["response_mask"],
-            alpha=alpha,
+            trajectory_ids=data.non_tensor_batch["traj_uid"],
+            turn_indices=data.batch["turn_index"],
+            gamma=float(gamma),
+            lam=float(lam),
+            unique_turn_mask=data.batch.get("arq_unique_turn_mask"),
             invalid_action_mask=invalid_action_mask,
             invalid_action_penalty_coef=float(kwargs.get("invalid_action_penalty_coef", 0.0)),
-            unique_turn_mask=unique_turn_mask,
             normalize=bool(arq_config.normalize_turn_advantage),
         )
         data.batch["advantages"] = arq_result["advantages"]
@@ -445,11 +428,22 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
         data.batch["token_len_advantages"] = arq_result["advantages"]
         data.batch["arq_turn_advantages"] = arq_result["turn_advantages"]
         data.batch["arq_raw_turn_advantages"] = arq_result["raw_turn_advantages"]
-        data.batch["arq_mc_advantages"] = arq_result["mc_advantages"]
+        data.batch["arq_gae_advantages"] = arq_result["gae_advantages"]
+        data.batch["arq_td_errors"] = arq_result["td_errors"]
         data.batch["arq_q_advantages"] = arq_result["q_advantages"]
-        data.batch["arq_alpha"] = torch.full_like(data.batch["mc_return"], alpha, dtype=torch.float32)
-        data.batch["arq_target_probs"] = torch.clamp(
-            data.batch["mc_return"].to(torch.float32) / float(arq_config.reward_max), min=0.0, max=1.0
+        data.batch["arq_v_targets"] = arq_result["v_targets"]
+        data.batch["arq_q_targets"] = arq_result["q_targets"]
+        data.batch["arq_unique_turn_mask"] = arq_result["unique_turn_mask"]
+        data.batch["arq_truncated"] = arq_result["truncated"]
+        v_target_units = arq_result["v_targets"] / float(arq_config.reward_max)
+        q_target_units = arq_result["q_targets"] / float(arq_config.reward_max)
+        data.batch["arq_v_target_clipped"] = (v_target_units < 0.0) | (v_target_units > 1.0)
+        data.batch["arq_q_target_clipped"] = (q_target_units < 0.0) | (q_target_units > 1.0)
+        data.batch["arq_v_target_probs"] = torch.clamp(
+            v_target_units, min=0.0, max=1.0
+        )
+        data.batch["arq_q_target_probs"] = torch.clamp(
+            q_target_units, min=0.0, max=1.0
         )
     else:
         raise NotImplementedError
@@ -694,10 +688,15 @@ class RayPPOTrainer:
             assert config.actor_rollout_ref.model.get("lora_rank", 0) == 0, "ARQ-PPO v1 does not support LoRA"
             assert not config.algorithm.use_kl_in_reward, "ARQ-PPO keeps KL in the policy loss, not the value target"
             assert arq.reward_mode == "bounded_outcome", "ARQ-PPO v1 supports bounded_outcome rewards only"
-            assert arq.q_target == "monte_carlo", "ARQ-PPO v1 supports Monte Carlo Q targets only"
+            assert arq.advantage_mode == "gae", "ARQ-PPO requires turn-level GAE advantages"
+            assert arq.q_target == "td0", "ARQ-PPO requires a one-step Bellman Q target"
             assert arq.reward_max > 0 and arq.value_temperature > 0
             assert arq.value_loss_coef >= 0 and arq.q_loss_coef >= 0
-            assert 0 <= arq.advantage_warmup_ratio <= 1
+            assert 0 <= config.algorithm.gamma <= 1
+            assert 0 <= config.algorithm.lam <= 1
+            assert config.actor_rollout_ref.actor.loss_agg_mode == "token-mean", (
+                "ARQ duplicate masking currently requires actor.loss_agg_mode=token-mean"
+            )
             assert config.actor_rollout_ref.rollout.temperature > 0
             assert not config.algorithm.filter_groups.enable, "ARQ-PPO v1 does not use group filtering"
             assert (
@@ -1261,6 +1260,26 @@ class RayPPOTrainer:
 
                     batch = adjust_batch(self.config, batch)
 
+                    if self.config.algorithm.adv_estimator == AdvantageEstimator.ARQ_PPO:
+                        # adjust_batch appends randomly selected padding copies.
+                        # Mark the first occurrence before balance_batch shuffles
+                        # rows so GAE always uses the original old-V evaluation,
+                        # while copied rows remain shape-only zero-gradient data.
+                        seen_turns = set()
+                        unique_turn_rows = []
+                        turn_indices = batch.batch["turn_index"].detach().cpu().tolist()
+                        for trajectory_id, turn_index in zip(
+                            batch.non_tensor_batch["traj_uid"], turn_indices
+                        ):
+                            key = (str(trajectory_id), int(turn_index))
+                            unique_turn_rows.append(key not in seen_turns)
+                            seen_turns.add(key)
+                        batch.batch["arq_unique_turn_mask"] = torch.tensor(
+                            unique_turn_rows,
+                            dtype=torch.bool,
+                            device=batch.batch["turn_index"].device,
+                        )
+
                     batch.batch["response_mask"] = compute_response_mask(batch)
                     # balance the number of valid tokens on each dp rank.
                     # Note that this breaks the order of data inside the batch.
@@ -1370,9 +1389,9 @@ class RayPPOTrainer:
                         # compute rewards. apply_invalid_action_penalty if available
                         if self.config.actor_rollout_ref.actor.get('use_invalid_action_penalty', True):
                             if self.config.algorithm.adv_estimator == AdvantageEstimator.ARQ_PPO:
-                                # Keep the Monte Carlo V/Q target equal to the
-                                # environment outcome.  ARQ adds this penalty to
-                                # the scalar policy advantage below.
+                                # ARQ derives GAE and Bellman targets exclusively
+                                # from env_reward.  Invalid-action shaping is
+                                # applied only to its scalar policy advantage.
                                 valid_action_ratio = np.mean(
                                     batch.non_tensor_batch['is_action_valid'].astype(np.float32)
                                 ).item()

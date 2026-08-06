@@ -207,29 +207,55 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> Dict[str,
         **({f"episode/{k}": v[0].item() for k, v in batch.non_tensor_batch.items() if "success_rate" in k}),
     }
 
-    if {"old_v_values", "old_q_values", "old_v_probs", "old_q_probs", "mc_return"}.issubset(batch.batch.keys()):
-        old_v = batch.batch["old_v_values"].to(torch.float32)
-        old_q = batch.batch["old_q_values"].to(torch.float32)
-        old_v_prob = batch.batch["old_v_probs"].to(torch.float32)
-        old_q_prob = batch.batch["old_q_probs"].to(torch.float32)
-        mc_return = batch.batch["mc_return"].to(torch.float32)
+    arq_metric_keys = {
+        "old_v_values",
+        "old_q_values",
+        "old_v_probs",
+        "old_q_probs",
+        "mc_return",
+        "arq_v_targets",
+        "arq_q_targets",
+        "arq_v_target_probs",
+        "arq_q_target_probs",
+        "arq_gae_advantages",
+        "arq_td_errors",
+    }
+    if arq_metric_keys.issubset(batch.batch.keys()):
+        unique_turn_mask = batch.batch.get(
+            "arq_unique_turn_mask",
+            torch.ones_like(batch.batch["old_v_values"], dtype=torch.bool),
+        ).bool()
+        old_v = batch.batch["old_v_values"][unique_turn_mask].to(torch.float32)
+        old_q = batch.batch["old_q_values"][unique_turn_mask].to(torch.float32)
+        old_v_prob = batch.batch["old_v_probs"][unique_turn_mask].to(torch.float32)
+        old_q_prob = batch.batch["old_q_probs"][unique_turn_mask].to(torch.float32)
+        mc_return = batch.batch["mc_return"][unique_turn_mask].to(torch.float32)
+        v_target = batch.batch["arq_v_targets"][unique_turn_mask].to(torch.float32)
+        q_target = batch.batch["arq_q_targets"][unique_turn_mask].to(torch.float32)
+        v_target_prob = batch.batch["arq_v_target_probs"][unique_turn_mask].to(torch.float32)
+        q_target_prob = batch.batch["arq_q_target_probs"][unique_turn_mask].to(torch.float32)
+        gae_advantage = batch.batch["arq_gae_advantages"][unique_turn_mask].to(torch.float32)
+        td_error = batch.batch["arq_td_errors"][unique_turn_mask].to(torch.float32)
         q_minus_v = old_q - old_v
-        return_variance = torch.var(mc_return, unbiased=False)
-        v_residual_variance = torch.var(mc_return - old_v, unbiased=False)
-        q_residual_variance = torch.var(mc_return - old_q, unbiased=False)
-        centered_return = mc_return - mc_return.mean()
-        centered_v = old_v - old_v.mean()
-        centered_q = old_q - old_q.mean()
-        v_correlation = (centered_return * centered_v).mean() / (
-            centered_return.std(unbiased=False) * centered_v.std(unbiased=False) + 1e-6
-        )
-        q_correlation = (centered_return * centered_q).mean() / (
-            centered_return.std(unbiased=False) * centered_q.std(unbiased=False) + 1e-6
-        )
-        target_prob = batch.batch.get("arq_target_probs")
-        if target_prob is None:
-            target_prob = torch.clamp(mc_return, min=0.0, max=1.0)
-        target_prob = target_prob.to(torch.float32)
+
+        def correlation(lhs, rhs):
+            centered_lhs = lhs - lhs.mean()
+            centered_rhs = rhs - rhs.mean()
+            return (centered_lhs * centered_rhs).mean() / (
+                centered_lhs.std(unbiased=False) * centered_rhs.std(unbiased=False) + 1e-6
+            )
+
+        v_target_variance = torch.var(v_target, unbiased=False)
+        q_target_variance = torch.var(q_target, unbiased=False)
+        mc_return_variance = torch.var(mc_return, unbiased=False)
+        v_residual_variance = torch.var(v_target - old_v, unbiased=False)
+        q_residual_variance = torch.var(q_target - old_q, unbiased=False)
+        v_mc_residual_variance = torch.var(mc_return - old_v, unbiased=False)
+        q_mc_residual_variance = torch.var(mc_return - old_q, unbiased=False)
+        q_mse = (old_q - q_target).square().mean()
+        v_as_q_mse = (old_v - q_target).square().mean()
+        q_advantage_std = q_minus_v.std(unbiased=False)
+        td_error_std = td_error.std(unbiased=False)
         metrics.update(
             {
                 "arq/old_v_value_mean": old_v.mean().detach().item(),
@@ -243,17 +269,44 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> Dict[str,
                 "arq/q_minus_v_mean": q_minus_v.mean().detach().item(),
                 "arq/q_minus_v_std": q_minus_v.std(unbiased=False).detach().item(),
                 "arq/q_v_near_collapse_ratio": (q_minus_v.abs() < 1e-3).float().mean().detach().item(),
-                "arq/v_explained_variance": (1.0 - v_residual_variance / (return_variance + 1e-5)).detach().item(),
-                "arq/q_explained_variance": (1.0 - q_residual_variance / (return_variance + 1e-5)).detach().item(),
-                "arq/v_return_correlation": v_correlation.detach().item(),
-                "arq/q_return_correlation": q_correlation.detach().item(),
-                "arq/v_brier": (old_v_prob - target_prob).square().mean().detach().item(),
-                "arq/q_brier": (old_q_prob - target_prob).square().mean().detach().item(),
+                "arq/v_explained_variance": (1.0 - v_residual_variance / (v_target_variance + 1e-5)).detach().item(),
+                "arq/q_explained_variance": (1.0 - q_residual_variance / (q_target_variance + 1e-5)).detach().item(),
+                "arq/v_target_correlation": correlation(old_v, v_target).detach().item(),
+                "arq/q_target_correlation": correlation(old_q, q_target).detach().item(),
+                "arq/v_mc_correlation": correlation(old_v, mc_return).detach().item(),
+                "arq/q_mc_correlation": correlation(old_q, mc_return).detach().item(),
+                "arq/v_mc_explained_variance": (
+                    1.0 - v_mc_residual_variance / (mc_return_variance + 1e-5)
+                ).detach().item(),
+                "arq/q_mc_explained_variance": (
+                    1.0 - q_mc_residual_variance / (mc_return_variance + 1e-5)
+                ).detach().item(),
+                "arq/v_target_mse": (old_v_prob - v_target_prob).square().mean().detach().item(),
+                "arq/q_target_mse": (old_q_prob - q_target_prob).square().mean().detach().item(),
+                "arq/q_incremental_mse_gain": (v_as_q_mse - q_mse).detach().item(),
+                "arq/q_advantage_td_correlation": correlation(q_minus_v, td_error).detach().item(),
+                "arq/q_advantage_signal_ratio": (q_advantage_std / (td_error_std + 1e-6)).detach().item(),
+                "arq/gae_advantage_mean": gae_advantage.mean().detach().item(),
+                "arq/gae_advantage_std": gae_advantage.std(unbiased=False).detach().item(),
+                "arq/td_error_mean": td_error.mean().detach().item(),
+                "arq/td_error_std": td_error_std.detach().item(),
+                "arq/v_target_mean": v_target.mean().detach().item(),
+                "arq/q_target_mean": q_target.mean().detach().item(),
                 "arq/mc_return_mean": mc_return.mean().detach().item(),
             }
         )
-        if "arq_alpha" in batch.batch:
-            metrics["arq/advantage_alpha"] = batch.batch["arq_alpha"].mean().detach().item()
+        if "arq_truncated" in batch.batch:
+            metrics["arq/horizon_truncation_ratio"] = (
+                batch.batch["arq_truncated"][unique_turn_mask].float().mean().detach().item()
+            )
+        if "arq_v_target_clipped" in batch.batch:
+            metrics["arq/v_target_clip_ratio"] = (
+                batch.batch["arq_v_target_clipped"][unique_turn_mask].float().mean().detach().item()
+            )
+        if "arq_q_target_clipped" in batch.batch:
+            metrics["arq/q_target_clip_ratio"] = (
+                batch.batch["arq_q_target_clipped"][unique_turn_mask].float().mean().detach().item()
+            )
     return metrics
 
 

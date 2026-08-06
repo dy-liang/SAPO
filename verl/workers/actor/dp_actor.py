@@ -509,7 +509,15 @@ class DataParallelPPOActor(BasePPOActor):
 
         select_keys = ["responses", "input_ids", "attention_mask", "position_ids", "old_log_probs", "advantages"]
         if self.arq_enabled:
-            select_keys.extend(["old_v_probs", "old_q_probs", "mc_return"])
+            select_keys.extend(
+                [
+                    "old_v_probs",
+                    "old_q_probs",
+                    "arq_v_target_probs",
+                    "arq_q_target_probs",
+                    "arq_unique_turn_mask",
+                ]
+            )
         if multi_turn:
             select_keys.append("loss_mask")
         if self.config.use_kl_loss:
@@ -558,6 +566,14 @@ class DataParallelPPOActor(BasePPOActor):
                         response_mask = data["loss_mask"][:, -response_length:]
                     else:
                         response_mask = attention_mask[:, -response_length:]
+                    arq_sample_mask = None
+                    if self.arq_enabled:
+                        arq_sample_mask = data["arq_unique_turn_mask"].to(
+                            device=response_mask.device, dtype=response_mask.dtype
+                        )
+                        # adjust_batch copies are shape-only padding.  Exclude
+                        # them from every ARQ gradient, not only GAE statistics.
+                        response_mask = response_mask * arq_sample_mask.unsqueeze(-1)
 
                     old_log_prob = data["old_log_probs"]
                     advantages = data["advantages"]
@@ -627,22 +643,19 @@ class DataParallelPPOActor(BasePPOActor):
                     if self.arq_enabled:
                         if arq_outputs is None:
                             raise RuntimeError("ARQ actor update requires current V/Q outputs")
-                        target_probs = torch.clamp(
-                            data["mc_return"].to(torch.float32) / float(self.arq_config.reward_max),
-                            min=0.0,
-                            max=1.0,
-                        )
                         value_loss, value_clipfrac = compute_arq_value_loss(
                             current_probs=arq_outputs["v_probs"],
                             old_probs=data["old_v_probs"],
-                            target_probs=target_probs,
+                            target_probs=data["arq_v_target_probs"],
                             cliprange=float(self.arq_config.value_cliprange),
+                            sample_mask=arq_sample_mask,
                         )
                         q_loss, q_clipfrac = compute_arq_value_loss(
                             current_probs=arq_outputs["q_probs"],
                             old_probs=data["old_q_probs"],
-                            target_probs=target_probs,
+                            target_probs=data["arq_q_target_probs"],
                             cliprange=float(self.arq_config.q_cliprange),
+                            sample_mask=arq_sample_mask,
                         )
                         policy_loss = (
                             policy_loss
@@ -658,6 +671,8 @@ class DataParallelPPOActor(BasePPOActor):
                                 "arq/q_clipfrac": q_clipfrac.detach().item(),
                                 "arq/current_v_prob_mean": arq_outputs["v_probs"].detach().mean().item(),
                                 "arq/current_q_prob_mean": arq_outputs["q_probs"].detach().mean().item(),
+                                "arq/v_target_prob_mean": data["arq_v_target_probs"].detach().mean().item(),
+                                "arq/q_target_prob_mean": data["arq_q_target_probs"].detach().mean().item(),
                                 "arq/current_q_minus_v_mean": (
                                     arq_outputs["q_values"] - arq_outputs["v_values"]
                                 ).detach().mean().item(),

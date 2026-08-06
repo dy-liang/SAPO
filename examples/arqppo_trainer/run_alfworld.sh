@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -euxo pipefail
-
+#pkill -f "keepgpu"
 ENGINE=vllm
 if [[ $# -gt 0 ]]; then
     if [[ "$1" != *=* ]]; then
@@ -14,8 +14,9 @@ export HF_ENDPOINT=${HF_ENDPOINT:-https://hf-mirror.com}
 
 num_cpus_per_env_worker=${NUM_CPUS_PER_ENV_WORKER:-0.05}
 train_data_size=${TRAIN_DATA_SIZE:-128}
-val_data_size=${VAL_DATA_SIZE:-128}
+val_data_size=${VAL_DATA_SIZE:-2}
 
+# nohup bash examples/arqppo_trainer/run_alfworld.sh > ./log/test_arqppo_gt_gae.log 2>&1 &
 # These are single-token Qwen2.5 delimiters that are unused in a text-only
 # ALFWorld prompt. ARQ validates them at worker startup and bans them from
 # vLLM sampling and policy normalization.
@@ -32,6 +33,7 @@ python3 -m examples.data_preprocess.prepare \
 python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=arq_ppo \
     algorithm.gamma=1.0 \
+    algorithm.lam=0.95 \
     algorithm.use_kl_in_reward=False \
     algorithm.arq.enable=True \
     "algorithm.arq.positive_token='${arq_positive_token}'" \
@@ -43,10 +45,8 @@ python3 -m verl.trainer.main_ppo \
     algorithm.arq.q_cliprange=0.2 \
     algorithm.arq.value_loss_coef=0.1 \
     algorithm.arq.q_loss_coef=0.1 \
-    algorithm.arq.q_target=monte_carlo \
-    algorithm.arq.advantage_mix_start=0.0 \
-    algorithm.arq.advantage_mix_end=1.0 \
-    algorithm.arq.advantage_warmup_ratio=0.05 \
+    algorithm.arq.advantage_mode=gae \
+    algorithm.arq.q_target=td0 \
     algorithm.arq.normalize_turn_advantage=True \
     algorithm.arq.exclude_value_tokens_from_policy=True \
     data.train_files="$HOME/data/verl-agent/text/train.parquet" \
@@ -65,7 +65,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.actor.ppo_mini_batch_size=256 \
-    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=32 \
+    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=16 \
     actor_rollout_ref.actor.ppo_epochs=1 \
     actor_rollout_ref.actor.use_dynamic_bsz=False \
     actor_rollout_ref.actor.ulysses_sequence_parallel_size=1 \
@@ -98,11 +98,14 @@ python3 -m verl.trainer.main_ppo \
     trainer.critic_warmup=0 \
     trainer.logger="['console','wandb']" \
     trainer.project_name=verl_agent \
-    trainer.experiment_name=arqppo_qwen2.5_1.5b \
+    trainer.experiment_name=arqppo_gae_qwen2.5_1.5b \
     trainer.n_gpus_per_node=2 \
     trainer.nnodes=1 \
     trainer.save_freq=-1 \
-    trainer.test_freq=5 \
+    trainer.test_freq=75 \
     trainer.total_epochs=150 \
     trainer.val_before_train=False \
     "$@"
+
+cd /home/heliyuan/project_code
+sh /home/heliyuan/project_code/keepgpu.sh
