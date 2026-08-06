@@ -1,0 +1,2 @@
+Looking in indexes: https://pypi.tuna.tsinghua.edu.cn/simple
+Requirement already satisfied: tqdm in /projects/hly/miniconda3/envs/verl-agent-webshop/lib/python3.10/site-packages (4.68.3)

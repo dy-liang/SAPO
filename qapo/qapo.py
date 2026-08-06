@@ -119,7 +119,7 @@ def compute_step_credits(batch):
     all_uid_trj_vals = torch.tensor(all_uid_trj_vals, dtype=torch.float32, device=batch.batch['input_ids'].device)
     return all_uid_trj_vals
 
-def linear_decay(epoch, start_epoch=0, end_epoch=150, start_value=1.0, end_value=0.0):
+def linear_decay(epoch, start_epoch=0, end_epoch=150, start_value=1.0, end_value=0.5):
     if epoch <= start_epoch:
         return start_value
     if epoch >= end_epoch:
@@ -165,8 +165,8 @@ def compute_qapo_outcome_advantage(
             traj_index=traj_index,
             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
         )
-    #advantage_wt = linear_decay(epoch) * advantage_wt
-    if epoch > 75: advantage_wt = 0.02
+    advantage_wt = linear_decay(epoch) * advantage_wt
+    #if epoch > 75: advantage_wt = 0.02
     scores = advantage_wg * grpo_advantages + advantage_ws * step_len_advantages + advantage_wt * token_len_advantages
     return scores, scores, grpo_advantages, step_len_advantages, token_len_advantages
 

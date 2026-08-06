@@ -28,7 +28,6 @@ from dataclasses import dataclass, field
 from enum import Enum
 from pprint import pprint
 from typing import Dict, Optional, Type
-import weave
 import numpy as np
 import ray
 import torch
@@ -303,6 +302,9 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
         )
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns
+        data.batch["grpo_advantages"] = advantages
+        data.batch["step_len_advantages"] = advantages
+        data.batch["token_len_advantages"] = advantages
     elif adv_estimator == AdvantageEstimator.QAPO:
         # TODO: test on more adv estimator type
         grpo_calculation_mask = data.batch["response_mask"]

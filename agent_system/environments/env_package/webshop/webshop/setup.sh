@@ -24,34 +24,29 @@ fi
 # Install Python Dependencies
 pip install -r requirements.txt;
 
-conda install mkl
-conda install -c conda-forge faiss-cpu
-
 # Install Environment Dependencies via `conda`
-# conda install -c pytorch faiss-cpu;
+conda install -c pytorch faiss-cpu;
 conda install -c conda-forge openjdk=11;
 
 # Download dataset into `data` folder via `gdown` command
-mkdir -p data;
-cd data;
-if [ "$data" == "small" ]; then
-  gdown https://drive.google.com/uc?id=1EgHdxQ_YxqIQlvvq5iKlCrkEKR6-j0Ib; # items_shuffle_1000 - product scraped info
-  gdown https://drive.google.com/uc?id=1IduG0xl544V_A_jv3tHXC0kyFi7PnyBu; # items_ins_v2_1000 - product attributes
-elif [ "$data" == "all" ]; then
-  gdown https://drive.google.com/uc?id=1EgHdxQ_YxqIQlvvq5iKlCrkEKR6-j0Ib; # items_shuffle_1000 - product scraped info
-  gdown https://drive.google.com/uc?id=1IduG0xl544V_A_jv3tHXC0kyFi7PnyBu; # items_ins_v2_1000 - product attributes
-  gdown https://drive.google.com/uc?id=1A2whVgOO0euk5O13n2iYDM0bQRkkRduB; # items_shuffle
-  gdown https://drive.google.com/uc?id=1s2j6NgHljiZzQNL3veZaAiyW_qDEgBNi; # items_ins_v2
-else
-  echo "[ERROR]: argument for `-d` flag not recognized"
-  helpFunction
-fi
-gdown https://drive.google.com/uc?id=14Kb5SPBk_jfdLZ_CDBNitW98QLDlKR5O # items_human_ins
-cd ..
+# mkdir -p data;
+# cd data;
+# if [ "$data" == "small" ]; then
+#   gdown https://drive.google.com/uc?id=1EgHdxQ_YxqIQlvvq5iKlCrkEKR6-j0Ib; # items_shuffle_1000 - product scraped info
+#   gdown https://drive.google.com/uc?id=1IduG0xl544V_A_jv3tHXC0kyFi7PnyBu; # items_ins_v2_1000 - product attributes
+# elif [ "$data" == "all" ]; then
+#   gdown https://drive.google.com/uc?id=1A2whVgOO0euk5O13n2iYDM0bQRkkRduB; # items_shuffle
+#   gdown https://drive.google.com/uc?id=1s2j6NgHljiZzQNL3veZaAiyW_qDEgBNi; # items_ins_v2
+# else
+#   echo "[ERROR]: argument for `-d` flag not recognized"
+#   helpFunction
+# fi
+# gdown https://drive.google.com/uc?id=14Kb5SPBk_jfdLZ_CDBNitW98QLDlKR5O # items_human_ins
+# cd ..
 
 # Download spaCy large NLP model
-python -m spacy download en_core_web_lg
-python -m spacy download en_core_web_sm
+#python -m spacy download en_core_web_lg
+# pip install en-core-web-lg@https://github.com/explosion/spacy-models/releases/download/en_core_web_lg-3.3.0/en_core_web_lg-3.3.0-py3-none-any.whl#sha256=6ce19d37dfe5280400f80a5954d41afca10cbc742b97bfcf4b0e452b6eb24273
 
 # Build search engine index
 cd search_engine
@@ -62,18 +57,18 @@ mkdir -p indexes
 cd ..
 
 # Create logging folder + samples of log data
-# get_human_trajs () {
-#   PYCMD=$(cat <<EOF
-# import gdown
-# url="https://drive.google.com/drive/u/1/folders/16H7LZe2otq4qGnKw_Ic1dkt-o3U9Zsto"
-# gdown.download_folder(url, quiet=True, remaining_ok=True)
-# EOF
-#   )
-#   python -c "$PYCMD"
-# }
-# mkdir -p user_session_logs/
-# cd user_session_logs/
-# echo "Downloading 50 example human trajectories..."
+get_human_trajs () {
+  PYCMD=$(cat <<EOF
+import gdown
+url="https://drive.google.com/drive/u/1/folders/16H7LZe2otq4qGnKw_Ic1dkt-o3U9Zsto"
+gdown.download_folder(url, quiet=True, remaining_ok=True)
+EOF
+  )
+  python -c "$PYCMD"
+}
+mkdir -p user_session_logs/
+cd user_session_logs/
+echo "Downloading 50 example human trajectories..."
 # get_human_trajs
-# echo "Downloading example trajectories complete"
-# cd ..
+echo "Downloading example trajectories complete"
+cd ..
