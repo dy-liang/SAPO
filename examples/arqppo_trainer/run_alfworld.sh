@@ -9,14 +9,14 @@ if [[ $# -gt 0 ]]; then
     fi
 fi
 export VLLM_ATTENTION_BACKEND=${VLLM_ATTENTION_BACKEND:-XFORMERS}
-#export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
+export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
 export HF_ENDPOINT=${HF_ENDPOINT:-https://hf-mirror.com}
 
-num_cpus_per_env_worker=${NUM_CPUS_PER_ENV_WORKER:-0.05}
+num_cpus_per_env_worker=${NUM_CPUS_PER_ENV_WORKER:-0.1}
 train_data_size=${TRAIN_DATA_SIZE:-128}
-val_data_size=${VAL_DATA_SIZE:-128}
+val_data_size=${VAL_DATA_SIZE:-2}
 
-# nohup bash examples/arqppo_trainer/run_alfworld.sh > ./log/test_arqppo_QV_gae_ap05.log 2>&1 &
+# nohup bash examples/arqppo_trainer/run_alfworld.sh > ./log/test_arqppo_QV_gae_ap1_9595.log 2>&1 &
 # These are single-token Qwen2.5 delimiters that are unused in a text-only
 # ALFWorld prompt. ARQ validates them at worker startup and bans them from
 # vLLM sampling and policy normalization.
@@ -32,7 +32,7 @@ python3 -m examples.data_preprocess.prepare \
 # <|vision_start|> as strings instead of trying to lex their pipe symbols.
 python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=arq_ppo \
-    algorithm.gamma=1.0 \
+    algorithm.gamma=0.95 \
     algorithm.lam=0.95 \
     algorithm.use_kl_in_reward=False \
     algorithm.arq.enable=True \
@@ -76,8 +76,8 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.fsdp_config.param_offload=False \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=False \
     actor_rollout_ref.actor.use_invalid_action_penalty=True \
-    actor_rollout_ref.actor.invalid_action_penalty_coef=0.5 \
-    actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=32 \
+    actor_rollout_ref.actor.invalid_action_penalty_coef=1.0 \
+    actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=64 \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
     actor_rollout_ref.rollout.name="$ENGINE" \
     actor_rollout_ref.rollout.n=1 \
@@ -87,7 +87,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.free_cache_engine=False \
     actor_rollout_ref.rollout.val_kwargs.temperature=0.4 \
     actor_rollout_ref.rollout.val_kwargs.do_sample=True \
-    actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=32 \
+    actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=64 \
     actor_rollout_ref.ref.fsdp_config.param_offload=False \
     actor_rollout_ref.novelty_module.enable=False \
     env.env_name=alfworld/AlfredTWEnv \
@@ -98,13 +98,13 @@ python3 -m verl.trainer.main_ppo \
     trainer.critic_warmup=0 \
     trainer.logger="['console','wandb']" \
     trainer.project_name=verl_agent \
-    trainer.experiment_name=arqppo_gae_qwen2.5_1.5b_ARQPPO_Gae_QV_Ap05 \
+    trainer.experiment_name=arqppo_gae_qwen2.5_1.5b_ARQPPO_Gae_QV_Ap1_9595 \
     trainer.n_gpus_per_node=1 \
     trainer.nnodes=1 \
     trainer.save_freq=150 \
-    trainer.test_freq=1 \
+    trainer.test_freq=-1 \
     trainer.total_epochs=150 \
-    trainer.val_before_train=True \
+    trainer.val_before_train=False \
     "$@"
 
 cd /home/heliyuan/project_code
