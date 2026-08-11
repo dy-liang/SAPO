@@ -26,6 +26,7 @@ import torch
 torch.set_printoptions(threshold=torch.inf)
 import verl.utils.torch_functional as verl_F
 
+_MAX_LOG_RATIO = 20.0
 
 class AdaptiveKLController:
     """
@@ -738,7 +739,13 @@ def compute_policy_loss(
     assert clip_ratio_c > 1.0, "The lower bound of the clip_ratio_c for dual-clip PPO should be greater than 1.0," + f" but get the value: {clip_ratio_c}."
 
     negative_approx_kl = log_prob - old_log_prob
-    ratio = torch.exp(negative_approx_kl)
+    #ratio = torch.exp(negative_approx_kl)
+
+    # Clamp before exp.  Clipping ``ratio`` afterwards is too late: exp can
+    # overflow first and produce a NaN gradient through 0 * Inf in backward.
+    safe_negative_approx_kl = torch.clamp(negative_approx_kl, max=_MAX_LOG_RATIO)
+    ratio = torch.exp(safe_negative_approx_kl)
+
     ppo_kl = verl_F.masked_mean(-negative_approx_kl, response_mask)
 
     pg_losses1 = -advantages * ratio
@@ -905,8 +912,14 @@ def kl_penalty(logprob: torch.FloatTensor, ref_logprob: torch.FloatTensor, kl_pe
     # # URL http://joschu.net/blog/kl-approx.html.
     if kl_penalty in ("low_var_kl", "k3"):
         kl = ref_logprob - logprob
-        ratio = torch.exp(kl)
-        kld = (ratio - kl - 1).contiguous()
+        # clamp before exp
+        safe_kl = torch.clamp(kl, max=_MAX_LOG_RATIO)
+        ratio = torch.exp(safe_kl)
+        kld = (ratio - safe_kl - 1).contiguous()
+
+        # old
+        # ratio = torch.exp(kl)
+        # kld = (ratio - kl - 1).contiguous()
         return torch.clamp(kld, min=-10, max=10)
 
     if kl_penalty == "full":
