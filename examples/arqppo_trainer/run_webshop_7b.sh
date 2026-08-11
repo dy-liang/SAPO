@@ -1,13 +1,7 @@
 #!/usr/bin/env bash
 pkill -f "keepgpu"
-set +e
-ENGINE=vllm
-if [[ $# -gt 0 ]]; then
-    if [[ "$1" != *=* ]]; then
-        ENGINE=$1
-        shift
-    fi
-fi
+set -x
+ENGINE=${1:-vllm}
 export VLLM_ATTENTION_BACKEND=${VLLM_ATTENTION_BACKEND:-XFORMERS}
 #export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
 export HF_ENDPOINT=${HF_ENDPOINT:-https://hf-mirror.com}

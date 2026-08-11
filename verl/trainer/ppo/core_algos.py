@@ -303,7 +303,7 @@ def compute_arq_gae_targets(
                 q_targets[duplicate_row] = q_targets[canonical_row]
                 truncated[duplicate_row] = truncated[canonical_row]
 
-        raw_policy_advantage = gae_advantages.clone()
+        raw_policy_advantage = gae_advantages.clone() #old_q_values - old_v_values
 
         if invalid_action_mask is not None:
             invalid_action_mask = invalid_action_mask.detach().to(

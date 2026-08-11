@@ -1,13 +1,7 @@
 #!/usr/bin/env bash
 pkill -f "keepgpu"
-set +e
-ENGINE=vllm
-if [[ $# -gt 0 ]]; then
-    if [[ "$1" != *=* ]]; then
-        ENGINE=$1
-        shift
-    fi
-fi
+set -x
+ENGINE=${1:-vllm}
 export VLLM_ATTENTION_BACKEND=${VLLM_ATTENTION_BACKEND:-XFORMERS}
 export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-1}
 export HF_ENDPOINT=${HF_ENDPOINT:-https://hf-mirror.com}
@@ -16,7 +10,7 @@ num_cpus_per_env_worker=${NUM_CPUS_PER_ENV_WORKER:-0.1}
 train_data_size=${TRAIN_DATA_SIZE:-128}
 val_data_size=${VAL_DATA_SIZE:-2}
 
-# nohup bash examples/arqppo_trainer/run_alfworld.sh > ./log/test_arqppo_QV_gae_ap1_gamlam9595_-TEST-NaN.log 2>&1 &
+# nohup bash examples/arqppo_trainer/run_alfworld.sh > ./log/test_arqppo_QV_gae_ap1_gamlam9595_wQ_init0.log 2>&1 &
 # These are single-token Qwen2.5 delimiters that are unused in a text-only
 # ALFWorld prompt. ARQ validates them at worker startup and bans them from
 # vLLM sampling and policy normalization.
@@ -98,12 +92,12 @@ python3 -m verl.trainer.main_ppo \
     trainer.critic_warmup=0 \
     trainer.logger="['console','wandb']" \
     trainer.project_name=verl_agent \
-    trainer.experiment_name=arqppo_vonly_gae_qwen2.5_1.5b_Gae_Vonly_postAction_Rew-pi+v_vloss05_ap1 \
+    trainer.experiment_name=arqppo_gae_qwen2.5_1.5b_ARQPPO_Gae_QV_Ap1_gamlam9595_wQ_init0 \
     trainer.n_gpus_per_node=1 \
     trainer.nnodes=1 \
-    trainer.save_freq=200 \
+    trainer.save_freq=150 \
     trainer.test_freq=-1 \
-    trainer.total_epochs=250 \
+    trainer.total_epochs=150 \
     trainer.val_before_train=False \
     "$@"
 
