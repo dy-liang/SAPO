@@ -437,13 +437,13 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
         data.batch["arq_truncated"] = arq_result["truncated"]
         v_target_units = arq_result["v_targets"] / float(arq_config.reward_max)
         q_target_units = arq_result["q_targets"] / float(arq_config.reward_max)
-        data.batch["arq_v_target_clipped"] = (v_target_units < 0.0) | (v_target_units > 1.0)
-        data.batch["arq_q_target_clipped"] = (q_target_units < 0.0) | (q_target_units > 1.0)
+        data.batch["arq_v_target_clipped"] = (v_target_units < -1.0) | (v_target_units > 1.0)
+        data.batch["arq_q_target_clipped"] = (q_target_units < -1.0) | (q_target_units > 1.0)
         data.batch["arq_v_target_probs"] = torch.clamp(
-            v_target_units, min=0.0, max=1.0
+            v_target_units, min=-1.0, max=1.0
         )
         data.batch["arq_q_target_probs"] = torch.clamp(
-            q_target_units, min=0.0, max=1.0
+            q_target_units, min=-1.0, max=1.0
         )
     else:
         raise NotImplementedError

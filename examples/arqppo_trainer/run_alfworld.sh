@@ -3,14 +3,14 @@ pkill -f "keepgpu"
 set -x
 ENGINE=${1:-vllm}
 export VLLM_ATTENTION_BACKEND=${VLLM_ATTENTION_BACKEND:-XFORMERS}
-export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-1}
+export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
 export HF_ENDPOINT=${HF_ENDPOINT:-https://hf-mirror.com}
 
 num_cpus_per_env_worker=${NUM_CPUS_PER_ENV_WORKER:-0.1}
 train_data_size=${TRAIN_DATA_SIZE:-128}
 val_data_size=${VAL_DATA_SIZE:-2}
 
-# nohup bash examples/arqppo_trainer/run_alfworld.sh > ./log/test_arqppo_QV_gae_ap1_gamlam9595_wQ_init0.log 2>&1 &
+# nohup bash examples/arqppo_trainer/run_alfworld.sh > ./log/test_arqppo_QV_gae_ap1_gamlam9595_wQ_init0_t5_fixPros.log 2>&1 &
 # These are single-token Qwen2.5 delimiters that are unused in a text-only
 # ALFWorld prompt. ARQ validates them at worker startup and bans them from
 # vLLM sampling and policy normalization.
@@ -92,7 +92,7 @@ python3 -m verl.trainer.main_ppo \
     trainer.critic_warmup=0 \
     trainer.logger="['console','wandb']" \
     trainer.project_name=verl_agent \
-    trainer.experiment_name=arqppo_gae_qwen2.5_1.5b_ARQPPO_Gae_QV_Ap1_gamlam9595_wQ_init0 \
+    trainer.experiment_name=arqppo_gae_qwen2.5_1.5b_ARQPPO_Gae_QV_Ap1_gamlam9595_wQ_init0_t5_fixPMatch \
     trainer.n_gpus_per_node=1 \
     trainer.nnodes=1 \
     trainer.save_freq=150 \
@@ -101,6 +101,5 @@ python3 -m verl.trainer.main_ppo \
     trainer.val_before_train=False \
     "$@"
 
-cd /home/heliyuan/project_code
-nohup python keepgpu.py --gpu 0 --util 25 --memory 1000 > keep_gpu.log 2>&1 &
+nohup python /home/heliyuan/project_code/keepgpu.py --gpu 0 --util 25 --memory 1000 > keep_gpu.log 2>&1 &
 echo "GPU ok!!"

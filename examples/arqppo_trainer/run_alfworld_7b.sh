@@ -2,15 +2,16 @@
 pkill -f "keepgpu"
 set -x
 ENGINE=${1:-vllm}
+export ARQ_MEMORY_COMPARE=1
 export VLLM_ATTENTION_BACKEND=${VLLM_ATTENTION_BACKEND:-XFORMERS}
-export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
+#export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-1}
 export HF_ENDPOINT=${HF_ENDPOINT:-https://hf-mirror.com}
 #export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 num_cpus_per_env_worker=${NUM_CPUS_PER_ENV_WORKER:-0.1}
 train_data_size=${TRAIN_DATA_SIZE:-128}
 val_data_size=${VAL_DATA_SIZE:-2}
 
-# nohup bash examples/arqppo_trainer/run_alfworld_7b.sh > ./log/test_Qwen7b_arqppo_QV_gae_ap05_vloss01_gamma099.log 2>&1 &
+# nohup bash examples/arqppo_trainer/run_alfworld_7b.sh > ./log/test_Qwen7b_arqppo_QV_gae_ap1_vloss01_gamlam9595_init0_t1_fixPros.log 2>&1 &
 # These are single-token Qwen2.5 delimiters that are unused in a text-only
 # ALFWorld prompt. ARQ validates them at worker startup and bans them from
 # vLLM sampling and policy normalization.
@@ -26,7 +27,7 @@ arq_negative_token=${ARQ_NEGATIVE_TOKEN:-'<|vision_end|>'}
 # <|vision_start|> as strings instead of trying to lex their pipe symbols.
 python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=arq_ppo \
-    algorithm.gamma=0.99 \
+    algorithm.gamma=0.95 \
     algorithm.lam=0.95 \
     algorithm.use_kl_in_reward=False \
     algorithm.arq.enable=True \
@@ -34,7 +35,7 @@ python3 -m verl.trainer.main_ppo \
     "algorithm.arq.negative_token='${arq_negative_token}'" \
     algorithm.arq.reward_mode=bounded_outcome \
     algorithm.arq.reward_max=10.0 \
-    algorithm.arq.value_temperature=5.0 \
+    algorithm.arq.value_temperature=1.0 \
     algorithm.arq.value_cliprange=0.2 \
     algorithm.arq.q_cliprange=0.2 \
     algorithm.arq.value_loss_coef=0.1 \
@@ -59,7 +60,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.actor.ppo_mini_batch_size=256 \
-    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1 \
+    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=16 \
     actor_rollout_ref.actor.ppo_epochs=1 \
     actor_rollout_ref.actor.use_dynamic_bsz=False \
     actor_rollout_ref.actor.ulysses_sequence_parallel_size=1 \
@@ -70,18 +71,18 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.fsdp_config.param_offload=False \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=False \
     actor_rollout_ref.actor.use_invalid_action_penalty=True \
-    actor_rollout_ref.actor.invalid_action_penalty_coef=0.5 \
-    actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=32 \
+    actor_rollout_ref.actor.invalid_action_penalty_coef=1.0 \
+    actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=16 \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
     actor_rollout_ref.rollout.name="$ENGINE" \
     actor_rollout_ref.rollout.n=1 \
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.7 \
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.45\
     actor_rollout_ref.rollout.enable_chunked_prefill=False \
     actor_rollout_ref.rollout.enforce_eager=False \
     actor_rollout_ref.rollout.free_cache_engine=False \
     actor_rollout_ref.rollout.val_kwargs.temperature=0.4 \
     actor_rollout_ref.rollout.val_kwargs.do_sample=True \
-    actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=32 \
+    actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=16 \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
     actor_rollout_ref.novelty_module.enable=False \
     env.env_name=alfworld/AlfredTWEnv \
@@ -92,8 +93,8 @@ python3 -m verl.trainer.main_ppo \
     trainer.critic_warmup=0 \
     trainer.logger="['console','wandb']" \
     trainer.project_name=verl_agent \
-    trainer.experiment_name=arqppo_gae_qwen2.5_7b_ARQPPO_Gae_QV_Ap05_Vloss01_gamma099 \
-    trainer.n_gpus_per_node=1 \
+    trainer.experiment_name=arqppo_gae_qwen2.5_7b_ARQPPO_Gae_QV_Ap1_gamlam9595_init0_t1_fixPros \
+    trainer.n_gpus_per_node=2 \
     trainer.nnodes=1 \
     trainer.save_freq=150 \
     trainer.test_freq=-1 \
