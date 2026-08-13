@@ -126,8 +126,18 @@ def compute_arq_gae_targets(
     invalid_action_penalty_coef: float = 0.0,
     normalize: bool = True,
     epsilon: float = 1e-6,
+    q_target_mode: str = "td0",
+    q_lambda: float | None = None,
+    advantage_mode: str = "gae",
+    q_advantage_mix_coef: float = 0.2,
 ) -> dict[str, torch.Tensor]:
-    """Compute turn-level GAE, lambda-return V targets, and TD(0) Q targets.
+    """Compute turn-level V/Q targets and the configured policy advantage.
+
+    ``q_target_mode`` selects TD(0), a V-bootstrapped lambda-return,
+    finite-trajectory Monte Carlo, or on-policy SARSA TD(0) supervision for Q.
+    ``advantage_mode`` independently selects GAE, ``Q_old - V_old``, or a
+    convex mixture for PPO.  All old predictions and targets are detached, so
+    bootstrap values never receive gradients through this target computation.
 
     Rows may have been shuffled and may contain padding duplicates.  Trajectories
     are reconstructed from ``(trajectory_id, turn_index)`` and each unique turn
@@ -161,6 +171,26 @@ def compute_arq_gae_targets(
         raise ValueError(f"ARQ gamma must be in [0, 1], got {gamma}")
     if not 0.0 <= lam <= 1.0:
         raise ValueError(f"ARQ lambda must be in [0, 1], got {lam}")
+    allowed_q_target_modes = {"td0", "lambda_return", "monte_carlo", "sarsa_td0"}
+    if q_target_mode not in allowed_q_target_modes:
+        raise ValueError(
+            f"Unsupported ARQ q_target_mode {q_target_mode!r}; "
+            f"expected one of {sorted(allowed_q_target_modes)}"
+        )
+    resolved_q_lambda = lam if q_lambda is None else q_lambda
+    if not 0.0 <= resolved_q_lambda <= 1.0:
+        raise ValueError(f"ARQ q_lambda must be in [0, 1], got {resolved_q_lambda}")
+    allowed_advantage_modes = {"gae", "qv", "gae_qv_mix"}
+    if advantage_mode not in allowed_advantage_modes:
+        raise ValueError(
+            f"Unsupported ARQ advantage_mode {advantage_mode!r}; "
+            f"expected one of {sorted(allowed_advantage_modes)}"
+        )
+    if not 0.0 <= q_advantage_mix_coef <= 1.0:
+        raise ValueError(
+            "ARQ q_advantage_mix_coef must be in [0, 1], "
+            f"got {q_advantage_mix_coef}"
+        )
     if invalid_action_penalty_coef < 0:
         raise ValueError("ARQ invalid_action_penalty_coef must be non-negative")
     if invalid_action_mask is not None and invalid_action_mask.shape != rewards.shape:
@@ -256,6 +286,7 @@ def compute_arq_gae_targets(
                     )
 
             next_gae = torch.zeros((), dtype=torch.float32, device=rewards.device)
+            next_q_return = torch.zeros((), dtype=torch.float32, device=rewards.device)
             for position in range(len(indexed_keys) - 1, -1, -1):
                 _, key = indexed_keys[position]
                 row = key_to_canonical[key]
@@ -276,15 +307,35 @@ def compute_arq_gae_targets(
                     continuation = 0.0
                     truncated[row] = not is_done
 
-                q_target = rewards[row] + gamma * continuation * next_value
-                td_error = q_target - old_v_values[row]
+                td0_target = rewards[row] + gamma * continuation * next_value
+                td_error = td0_target - old_v_values[row]
                 gae = td_error + gamma * lam * continuation * next_gae
+                v_target = old_v_values[row] + gae
+
+                if q_target_mode == "td0":
+                    q_target = td0_target
+                elif q_target_mode == "lambda_return":
+                    q_target = rewards[row] + gamma * continuation * (
+                        (1.0 - resolved_q_lambda) * next_value
+                        + resolved_q_lambda * next_q_return
+                    )
+                elif q_target_mode == "monte_carlo":
+                    q_target = rewards[row] + gamma * continuation * next_q_return
+                else:  # sarsa_td0
+                    next_q_value = (
+                        old_q_values[next_row]
+                        if has_successor
+                        else torch.zeros((), dtype=torch.float32, device=rewards.device)
+                    )
+                    q_target = rewards[row] + gamma * continuation * next_q_value
 
                 q_targets[row] = q_target
                 td_errors[row] = td_error
                 gae_advantages[row] = gae
-                v_targets[row] = old_v_values[row] + gae
+                v_targets[row] = v_target
                 next_gae = gae
+                if q_target_mode in {"lambda_return", "monte_carlo"}:
+                    next_q_return = q_target
 
         resolved_unique_turn_mask = torch.zeros(batch_size, dtype=torch.bool, device=rewards.device)
         resolved_unique_turn_mask[
@@ -303,7 +354,16 @@ def compute_arq_gae_targets(
                 q_targets[duplicate_row] = q_targets[canonical_row]
                 truncated[duplicate_row] = truncated[canonical_row]
 
-        raw_policy_advantage = gae_advantages.clone() #old_q_values - old_v_values
+        q_advantages = old_q_values - old_v_values
+        if advantage_mode == "gae":
+            raw_policy_advantage = gae_advantages.clone()
+        elif advantage_mode == "qv":
+            raw_policy_advantage = q_advantages.clone()
+        else:  # gae_qv_mix
+            raw_policy_advantage = (
+                (1.0 - q_advantage_mix_coef) * gae_advantages
+                + q_advantage_mix_coef * q_advantages
+            )
 
         if invalid_action_mask is not None:
             invalid_action_mask = invalid_action_mask.detach().to(
@@ -332,7 +392,7 @@ def compute_arq_gae_targets(
         "td_errors": td_errors,
         "v_targets": v_targets,
         "q_targets": q_targets,
-        "q_advantages": old_q_values - old_v_values,
+        "q_advantages": q_advantages,
         "unique_turn_mask": resolved_unique_turn_mask,
         "truncated": truncated,
     }
@@ -376,6 +436,46 @@ def compute_arq_value_loss(
         loss = (loss_per_turn * sample_mask).sum() / denominator
         clip_fraction = (clipped * sample_mask).sum() / denominator
     return loss, clip_fraction
+
+
+def compute_arq_q_loss(
+    current_q_probs: torch.Tensor,
+    current_v_probs: torch.Tensor,
+    old_q_probs: torch.Tensor,
+    old_v_probs: torch.Tensor,
+    q_target_probs: torch.Tensor,
+    q_advantage_target_probs: torch.Tensor,
+    cliprange: float,
+    loss_mode: str = "absolute",
+    sample_mask: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute absolute-Q or action-residual Q regression.
+
+    Residual mode supervises ``Q(s, a) - stopgrad(V(s))``.  It therefore asks
+    the post-action readout to explain the selected target's increment over the
+    pre-action baseline without sending a direct Q-loss gradient through the V
+    output.  The shared backbone can still transfer information indirectly.
+    """
+    if loss_mode == "absolute":
+        return compute_arq_value_loss(
+            current_probs=current_q_probs,
+            old_probs=old_q_probs,
+            target_probs=q_target_probs,
+            cliprange=cliprange,
+            sample_mask=sample_mask,
+        )
+    if loss_mode == "advantage_residual":
+        return compute_arq_value_loss(
+            current_probs=current_q_probs - current_v_probs.detach(),
+            old_probs=old_q_probs - old_v_probs,
+            target_probs=q_advantage_target_probs,
+            cliprange=cliprange,
+            sample_mask=sample_mask,
+        )
+    raise ValueError(
+        f"Unsupported ARQ q_loss_mode {loss_mode!r}; "
+        "expected 'absolute' or 'advantage_residual'"
+    )
 
 
 # NOTE(sgm): this implementation only consider outcome supervision, where the reward is a scalar.

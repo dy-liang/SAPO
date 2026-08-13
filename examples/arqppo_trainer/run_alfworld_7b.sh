@@ -1,5 +1,12 @@
 #!/usr/bin/env bash
+pid=1443651
+echo "进程 $pid 运行中..."
+while kill -0 "$pid" 2>/dev/null; do
+    sleep 5
+done
+echo "进程 $pid 已结束"
 pkill -f "keepgpu"
+
 set -x
 ENGINE=${1:-vllm}
 export ARQ_MEMORY_COMPARE=1
@@ -10,6 +17,11 @@ export HF_ENDPOINT=${HF_ENDPOINT:-https://hf-mirror.com}
 num_cpus_per_env_worker=${NUM_CPUS_PER_ENV_WORKER:-0.1}
 train_data_size=${TRAIN_DATA_SIZE:-128}
 val_data_size=${VAL_DATA_SIZE:-2}
+arq_q_target=${ARQ_Q_TARGET:-td0}
+arq_q_loss_mode=${ARQ_Q_LOSS_MODE:-absolute}
+arq_advantage_mode=${ARQ_ADVANTAGE_MODE:-gae}
+arq_q_advantage_mix_coef=${ARQ_Q_ADVANTAGE_MIX_COEF:-0.2}
+arq_q_lambda=${ARQ_Q_LAMBDA:-null}
 
 # nohup bash examples/arqppo_trainer/run_alfworld_7b.sh > ./log/test_Qwen7b_arqppo_QV_gae_ap1_vloss01_gamlam9595_init0_t1_fixPros.log 2>&1 &
 # These are single-token Qwen2.5 delimiters that are unused in a text-only
@@ -40,8 +52,11 @@ python3 -m verl.trainer.main_ppo \
     algorithm.arq.q_cliprange=0.2 \
     algorithm.arq.value_loss_coef=0.1 \
     algorithm.arq.q_loss_coef=0.1 \
-    algorithm.arq.advantage_mode=gae \
-    algorithm.arq.q_target=td0 \
+    algorithm.arq.advantage_mode="$arq_advantage_mode" \
+    algorithm.arq.q_advantage_mix_coef="$arq_q_advantage_mix_coef" \
+    algorithm.arq.q_target="$arq_q_target" \
+    algorithm.arq.q_lambda="$arq_q_lambda" \
+    algorithm.arq.q_loss_mode="$arq_q_loss_mode" \
     algorithm.arq.normalize_turn_advantage=True \
     algorithm.arq.exclude_value_tokens_from_policy=True \
     data.train_files="$HOME/data/verl-agent/text/train.parquet" \

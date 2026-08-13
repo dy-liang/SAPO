@@ -275,8 +275,16 @@ algorithm:
     q_cliprange: 0.2
     value_loss_coef: 0.1
     q_loss_coef: 0.1
+    # absolute: regress Q to the selected return target.
+    # advantage_residual: regress Q-stopgrad(V) to target-V_old.
+    q_loss_mode: absolute
+    # gae, qv, or gae_qv_mix (the latter two are experimental).
     advantage_mode: gae
+    q_advantage_mix_coef: 0.2
+    # td0, lambda_return, monte_carlo, or sarsa_td0.
     q_target: td0
+    # null reuses algorithm.lam for a lambda_return Q target.
+    q_lambda: null
     normalize_turn_advantage: True
     exclude_value_tokens_from_policy: True
   filter_groups: # DAPO from https://arxiv.org/abs/2503.14476

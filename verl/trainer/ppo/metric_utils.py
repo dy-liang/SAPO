@@ -234,6 +234,7 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> Dict[str,
         q_target = batch.batch["arq_q_targets"][unique_turn_mask].to(torch.float32)
         v_target_prob = batch.batch["arq_v_target_probs"][unique_turn_mask].to(torch.float32)
         q_target_prob = batch.batch["arq_q_target_probs"][unique_turn_mask].to(torch.float32)
+        q_target_advantage = q_target - old_v
         gae_advantage = batch.batch["arq_gae_advantages"][unique_turn_mask].to(torch.float32)
         td_error = batch.batch["arq_td_errors"][unique_turn_mask].to(torch.float32)
         q_minus_v = old_q - old_v
@@ -256,6 +257,7 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> Dict[str,
         v_as_q_mse = (old_v - q_target).square().mean()
         q_advantage_std = q_minus_v.std(unbiased=False)
         td_error_std = td_error.std(unbiased=False)
+        q_target_advantage_std = q_target_advantage.std(unbiased=False)
         metrics.update(
             {
                 "arq/old_v_value_mean": old_v.mean().detach().item(),
@@ -286,6 +288,15 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> Dict[str,
                 "arq/q_incremental_mse_gain": (v_as_q_mse - q_mse).detach().item(),
                 "arq/q_advantage_td_correlation": correlation(q_minus_v, td_error).detach().item(),
                 "arq/q_advantage_signal_ratio": (q_advantage_std / (td_error_std + 1e-6)).detach().item(),
+                "arq/q_advantage_target_correlation": correlation(
+                    q_minus_v, q_target_advantage
+                ).detach().item(),
+                "arq/q_advantage_target_mse": (
+                    q_minus_v - q_target_advantage
+                ).square().mean().detach().item(),
+                "arq/q_advantage_target_signal_ratio": (
+                    q_advantage_std / (q_target_advantage_std + 1e-6)
+                ).detach().item(),
                 "arq/gae_advantage_mean": gae_advantage.mean().detach().item(),
                 "arq/gae_advantage_std": gae_advantage.std(unbiased=False).detach().item(),
                 "arq/td_error_mean": td_error.mean().detach().item(),

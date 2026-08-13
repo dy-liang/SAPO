@@ -416,6 +416,14 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
             turn_indices=data.batch["turn_index"],
             gamma=float(gamma),
             lam=float(lam),
+            q_target_mode=str(arq_config.get("q_target", "td0")),
+            q_lambda=(
+                None
+                if arq_config.get("q_lambda", None) is None
+                else float(arq_config.q_lambda)
+            ),
+            advantage_mode=str(arq_config.get("advantage_mode", "gae")),
+            q_advantage_mix_coef=float(arq_config.get("q_advantage_mix_coef", 0.2)),
             unique_turn_mask=data.batch.get("arq_unique_turn_mask"),
             invalid_action_mask=invalid_action_mask,
             invalid_action_penalty_coef=float(kwargs.get("invalid_action_penalty_coef", 0.0)),
@@ -688,8 +696,22 @@ class RayPPOTrainer:
             assert config.actor_rollout_ref.model.get("lora_rank", 0) == 0, "ARQ-PPO v1 does not support LoRA"
             assert not config.algorithm.use_kl_in_reward, "ARQ-PPO keeps KL in the policy loss, not the value target"
             assert arq.reward_mode == "bounded_outcome", "ARQ-PPO v1 supports bounded_outcome rewards only"
-            assert arq.advantage_mode == "gae", "ARQ-PPO requires turn-level GAE advantages"
-            assert arq.q_target == "td0", "ARQ-PPO requires a one-step Bellman Q target"
+            advantage_mode = str(arq.get("advantage_mode", "gae"))
+            q_target = str(arq.get("q_target", "td0"))
+            q_loss_mode = str(arq.get("q_loss_mode", "absolute"))
+            q_advantage_mix_coef = float(arq.get("q_advantage_mix_coef", 0.2))
+            q_lambda = arq.get("q_lambda", None)
+            assert advantage_mode in {"gae", "qv", "gae_qv_mix"}, (
+                "ARQ-PPO advantage_mode must be gae, qv, or gae_qv_mix"
+            )
+            assert q_target in {"td0", "lambda_return", "monte_carlo", "sarsa_td0"}, (
+                "ARQ-PPO q_target must be td0, lambda_return, monte_carlo, or sarsa_td0"
+            )
+            assert q_loss_mode in {"absolute", "advantage_residual"}, (
+                "ARQ-PPO q_loss_mode must be absolute or advantage_residual"
+            )
+            assert 0 <= q_advantage_mix_coef <= 1
+            assert q_lambda is None or 0 <= float(q_lambda) <= 1
             assert arq.reward_max > 0 and arq.value_temperature > 0
             assert arq.value_loss_coef >= 0 and arq.q_loss_coef >= 0
             assert 0 <= config.algorithm.gamma <= 1

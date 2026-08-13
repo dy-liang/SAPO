@@ -36,7 +36,14 @@ from verl.trainer.ppo.arq import (
     padded_positions_to_unpadded_indices,
     value_outputs_from_logits,
 )
-from verl.trainer.ppo.core_algos import agg_loss, compute_arq_value_loss, compute_policy_loss, compute_policy_loss_gspo, kl_penalty
+from verl.trainer.ppo.core_algos import (
+    agg_loss,
+    compute_arq_q_loss,
+    compute_arq_value_loss,
+    compute_policy_loss,
+    compute_policy_loss_gspo,
+    kl_penalty,
+)
 from verl.utils.debug import GPUMemoryLogger
 from verl.utils.device import get_device_name, get_torch_device, is_cuda_available, is_npu_available
 from verl.utils.fsdp_utils import FSDPModule, fsdp2_clip_grad_norm_
@@ -650,17 +657,38 @@ class DataParallelPPOActor(BasePPOActor):
                             cliprange=float(self.arq_config.value_cliprange),
                             sample_mask=arq_sample_mask,
                         )
-                        q_loss, q_clipfrac = compute_arq_value_loss(
-                            current_probs=arq_outputs["q_probs"],
-                            old_probs=data["old_q_probs"],
-                            target_probs=data["arq_q_target_probs"],
-                            cliprange=float(self.arq_config.q_cliprange),
-                            sample_mask=arq_sample_mask,
-                        )
+                        q_loss_coef = float(self.arq_config.q_loss_coef)
+                        if q_loss_coef > 0.0:
+                            q_loss, q_clipfrac = compute_arq_q_loss(
+                                current_q_probs=arq_outputs["q_probs"],
+                                current_v_probs=arq_outputs["v_probs"],
+                                old_q_probs=data["old_q_probs"],
+                                old_v_probs=data["old_v_probs"],
+                                q_target_probs=data["arq_q_target_probs"],
+                                q_advantage_target_probs=(
+                                    data["arq_q_target_probs"] - data["old_v_probs"]
+                                ),
+                                cliprange=float(self.arq_config.q_cliprange),
+                                loss_mode=str(self.arq_config.get("q_loss_mode", "absolute")),
+                                sample_mask=arq_sample_mask,
+                            )
+                        else:
+                            # A true no-Q-training ablation: avoid 0 * NaN and
+                            # do not build an unnecessary Q-loss autograd branch.
+                            q_loss = policy_loss.new_zeros(())
+                            q_clipfrac = policy_loss.new_zeros(())
+                        advantage_mode = str(self.arq_config.get("advantage_mode", "gae"))
+                        policy_q_weight = {
+                            "gae": 0.0,
+                            "qv": 1.0,
+                            "gae_qv_mix": float(
+                                self.arq_config.get("q_advantage_mix_coef", 0.2)
+                            ),
+                        }[advantage_mode]
                         policy_loss = (
                             policy_loss
                             + float(self.arq_config.value_loss_coef) * value_loss
-                            + float(self.arq_config.q_loss_coef) * q_loss
+                            + q_loss_coef * q_loss
                         )
                         append_to_dict(
                             metrics,
@@ -669,10 +697,14 @@ class DataParallelPPOActor(BasePPOActor):
                                 "arq/q_loss": q_loss.detach().item(),
                                 "arq/value_clipfrac": value_clipfrac.detach().item(),
                                 "arq/q_clipfrac": q_clipfrac.detach().item(),
+                                "arq/policy_q_weight": policy_q_weight,
                                 "arq/current_v_prob_mean": arq_outputs["v_probs"].detach().mean().item(),
                                 "arq/current_q_prob_mean": arq_outputs["q_probs"].detach().mean().item(),
                                 "arq/v_target_prob_mean": data["arq_v_target_probs"].detach().mean().item(),
                                 "arq/q_target_prob_mean": data["arq_q_target_probs"].detach().mean().item(),
+                                "arq/q_advantage_target_prob_mean": (
+                                    data["arq_q_target_probs"] - data["old_v_probs"]
+                                ).detach().mean().item(),
                                 "arq/current_q_minus_v_mean": (
                                     arq_outputs["q_values"] - arq_outputs["v_values"]
                                 ).detach().mean().item(),
