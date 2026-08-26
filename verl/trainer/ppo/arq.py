@@ -271,5 +271,6 @@ def value_outputs_from_logits(
     if reward_max <= 0:
         raise ValueError(f"reward_max must be positive, got {reward_max}")
     logit_gaps = (positive_logits - negative_logits) / value_temperature
-    scores = 2.0 * torch.sigmoid(logit_gaps) - 1
+    #scores = 2.0 * torch.sigmoid(logit_gaps) - 1
+    scores = torch.clamp(logit_gaps, -1, 1)
     return {"probs": scores, "values": scores * reward_max, "logit_gaps": logit_gaps}

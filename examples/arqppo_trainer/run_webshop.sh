@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-pid=1443651
+pid=3857692
 echo "进程 $pid 运行中..."
 while kill -0 "$pid" 2>/dev/null; do
     sleep 5
@@ -10,29 +10,33 @@ pkill -f "keepgpu"
 set -x
 ENGINE=${1:-vllm}
 export VLLM_ATTENTION_BACKEND=${VLLM_ATTENTION_BACKEND:-XFORMERS}
-#export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
+export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
 export HF_ENDPOINT=${HF_ENDPOINT:-https://hf-mirror.com}
 
-num_cpus_per_env_worker=${NUM_CPUS_PER_ENV_WORKER:-0.1}
+num_cpus_per_env_worker=${NUM_CPUS_PER_ENV_WORKER:-0.05}
 train_data_size=${TRAIN_DATA_SIZE:-128}
 val_data_size=${VAL_DATA_SIZE:-2}
-arq_q_target=${ARQ_Q_TARGET:-td0}
-arq_q_loss_mode=${ARQ_Q_LOSS_MODE:-absolute}
-arq_advantage_mode=${ARQ_ADVANTAGE_MODE:-gae}
+# "td0": r_t+\gamma V_{\rm old}(s_{t+1}) = \delta_t
+# "lambda_return": G_t^{\lambda_Q}
+# "monte_carlo": G_t
+# "sarsa_td0": r_t+\gamma Q_{old}(s_{t+1},a_{t+1})-V_{old}(s_t)
+arq_q_target=${ARQ_Q_TARGET:-sarsa_td0}
+arq_q_loss_mode=${ARQ_Q_LOSS_MODE:-absolute} # {absolute, advantage_residual}
+arq_advantage_mode=${ARQ_ADVANTAGE_MODE:-gae} #{"gae", "qv", "gae_qv_mix"}
 arq_q_advantage_mix_coef=${ARQ_Q_ADVANTAGE_MIX_COEF:-0.2}
 arq_q_lambda=${ARQ_Q_LAMBDA:-null}
 
-# nohup bash examples/arqppo_trainer/run_webshop.sh > ./log/test_arqppo_QV_gae_ap1_9595_wQ_init0_t1_fixProbs.log 2>&1 &
+# nohup bash examples/arqppo_trainer/run_webshop.sh > ./log/Web_arqppo_QV_gae_ap1_9595_init0_t1_woQ_woNorm_s00_wClip.log 2>&1 &
 # These are single-token Qwen2.5 delimiters that are unused in a text-only
 # ALFWorld prompt. ARQ validates them at worker startup and bans them from
 # vLLM sampling and policy normalization.
 arq_positive_token=${ARQ_POSITIVE_TOKEN:-'<|vision_start|>'}
 arq_negative_token=${ARQ_NEGATIVE_TOKEN:-'<|vision_end|>'}
 
-# python3 -m examples.data_preprocess.prepare \
-#     --mode text \
-#     --train_data_size "$train_data_size" \
-#     --val_data_size "$val_data_size"
+python3 -m examples.data_preprocess.prepare \
+    --mode text \
+    --train_data_size "$train_data_size" \
+    --val_data_size "$val_data_size"
 
 # Keep the inner quotes in argv so Hydra treats delimiters such as
 # <|vision_start|> as strings instead of trying to lex their pipe symbols.
@@ -107,7 +111,7 @@ python3 -m verl.trainer.main_ppo \
     trainer.critic_warmup=0 \
     trainer.logger="['console','wandb']" \
     trainer.project_name=verl_agent_webshop \
-    trainer.experiment_name=arqppo_gae_qwen2.5_1.5b_ARQPPO_Gae_QV_Ap1_9595_wQ_init0_t1_fixProbs \
+    trainer.experiment_name=qwen2.5_1.5b_SAPO_Gae_QV_Ap1_9595_init0_t1_wQ_wNorm_s3_wClip \
     trainer.n_gpus_per_node=1 \
     trainer.nnodes=1 \
     trainer.save_freq=150 \
