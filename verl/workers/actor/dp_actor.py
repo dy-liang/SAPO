@@ -32,7 +32,7 @@ import verl.utils.torch_functional as verl_F
 from verl import DataProto
 from verl.trainer.ppo.arq import (
     get_arq_boundary_positions,
-    masked_policy_logprobs_and_entropy,
+    mask_arq_policy_logits_,
     padded_positions_to_unpadded_indices,
     value_outputs_from_logits,
 )
@@ -137,27 +137,43 @@ class DataParallelPPOActor(BasePPOActor):
     def _extract_arq_outputs(self, raw_logits, attention_mask, response_length, unpad_indices=None):
         """Extract bounded V/Q scalars from raw next-token logits."""
         v_positions, q_positions = get_arq_boundary_positions(attention_mask, response_length)
+        boundary_positions = torch.stack((v_positions, q_positions), dim=-1)
+        value_token_ids = torch.as_tensor(
+            self.arq_token_ids, dtype=torch.long, device=raw_logits.device
+        )
         if unpad_indices is not None:
             sequence_length = attention_mask.shape[1]
-            v_indices = padded_positions_to_unpadded_indices(v_positions, unpad_indices, sequence_length)
-            q_indices = padded_positions_to_unpadded_indices(q_positions, unpad_indices, sequence_length)
-            v_logits = raw_logits[v_indices]
-            q_logits = raw_logits[q_indices]
+            compact_positions = torch.stack(
+                (
+                    padded_positions_to_unpadded_indices(v_positions, unpad_indices, sequence_length),
+                    padded_positions_to_unpadded_indices(q_positions, unpad_indices, sequence_length),
+                ),
+                dim=-1,
+            )
+            # A single advanced-indexing branch gathers only [B, V/Q, +/-]
+            # scalars instead of copying two full [B, vocab] rows.
+            boundary_value_logits = raw_logits[
+                compact_positions.unsqueeze(-1), value_token_ids.view(1, 1, -1)
+            ]
         else:
             batch_indices = torch.arange(raw_logits.shape[0], device=raw_logits.device)
-            v_logits = raw_logits[batch_indices, v_positions]
-            q_logits = raw_logits[batch_indices, q_positions]
+            boundary_value_logits = raw_logits[
+                batch_indices.view(-1, 1, 1),
+                boundary_positions.unsqueeze(-1),
+                value_token_ids.view(1, 1, -1),
+            ]
 
-        positive_id, negative_id = self.arq_token_ids
+        v_logits = boundary_value_logits[:, 0]
+        q_logits = boundary_value_logits[:, 1]
         v_output = value_outputs_from_logits(
-            v_logits[:, positive_id],
-            v_logits[:, negative_id],
+            v_logits[:, 0],
+            v_logits[:, 1],
             value_temperature=float(self.arq_config.value_temperature),
             reward_max=float(self.arq_config.reward_max),
         )
         q_output = value_outputs_from_logits(
-            q_logits[:, positive_id],
-            q_logits[:, negative_id],
+            q_logits[:, 0],
+            q_logits[:, 1],
             value_temperature=float(self.arq_config.value_temperature),
             reward_max=float(self.arq_config.reward_max),
         )
@@ -261,26 +277,20 @@ class DataParallelPPOActor(BasePPOActor):
                     # storage for policy-temperature scaling to avoid another
                     # [tokens, vocab] allocation.
                     policy_logits_rmpad = logits_rmpad.div_(temperature)
+                    if self.arq_enabled:
+                        mask_arq_policy_logits_(policy_logits_rmpad, self.arq_token_ids)
 
                     # if use_sp: ((total_nnz / sp) + pad) ; if not use_sp: (batch, seqlen)
-                    if self.arq_enabled:
-                        log_probs, entropy_rmpad = masked_policy_logprobs_and_entropy(
-                            logits=policy_logits_rmpad,
-                            labels=input_ids_rmpad_rolled,
-                            excluded_token_ids=self.arq_token_ids,
-                            calculate_entropy=calculate_entropy,
-                        )
-                    else:
-                        inplace_backward = not calculate_entropy
-                        log_probs = logprobs_from_logits(
-                            logits=policy_logits_rmpad,
-                            labels=input_ids_rmpad_rolled,
-                            inplace_backward=inplace_backward,
-                        )
+                    inplace_backward = not calculate_entropy
+                    log_probs = logprobs_from_logits(
+                        logits=policy_logits_rmpad,
+                        labels=input_ids_rmpad_rolled,
+                        inplace_backward=inplace_backward,
+                    )
 
-                        # compute entropy
-                        if calculate_entropy:
-                            entropy_rmpad = self.compute_entropy_from_logits(policy_logits_rmpad)  # ((total_nnz / sp) + pad)
+                    # Reuse the regular PPO compiled entropy implementation.
+                    if calculate_entropy:
+                        entropy_rmpad = self.compute_entropy_from_logits(policy_logits_rmpad)  # ((total_nnz / sp) + pad)
 
                 # gather log_prob if sp > 1
                 if self.use_ulysses_sp:
@@ -345,15 +355,19 @@ class DataParallelPPOActor(BasePPOActor):
                     # Boundary values have already been copied out of the raw
                     # tensor, so policy scaling can safely reuse logits storage.
                     policy_logits = raw_logits.div_(temperature)
+                    if self.arq_enabled:
+                        mask_arq_policy_logits_(policy_logits, self.arq_token_ids)
                     response_logits = policy_logits[:, -response_length - 1 : -1, :]
                     if self.arq_enabled:
-                        log_probs, entropy = masked_policy_logprobs_and_entropy(
-                            logits=response_logits,
-                            labels=micro_batch["responses"],
-                            excluded_token_ids=self.arq_token_ids,
-                            calculate_entropy=calculate_entropy,
+                        log_probs = logprobs_from_logits(
+                            response_logits,
+                            micro_batch["responses"],
+                            inplace_backward=not calculate_entropy,
                         )
+                        if calculate_entropy:
+                            entropy = self.compute_entropy_from_logits(response_logits)  # (bsz, response_length)
                     else:
+                        # Preserve the existing non-ARQ padded path exactly.
                         log_probs = logprobs_from_logits(response_logits, micro_batch["responses"])
                         if calculate_entropy:
                             entropy = verl_F.entropy_from_logits(response_logits)  # (bsz, response_length)

@@ -20,7 +20,7 @@ keeps the regular PPO/GRPO paths unchanged.
 
 from __future__ import annotations
 
-from typing import Iterable, Optional, Sequence
+from typing import Iterable, Optional
 
 import torch
 
@@ -197,66 +197,33 @@ def padded_positions_to_unpadded_indices(
     return compact_positions
 
 
-def _kept_vocab_slices(vocab_size: int, excluded_token_ids: Sequence[int]) -> list[slice]:
-    excluded = sorted(set(int(token_id) for token_id in excluded_token_ids))
-    kept_slices = []
-    start = 0
-    for token_id in excluded:
-        if start < token_id:
-            kept_slices.append(slice(start, token_id))
-        start = token_id + 1
-    if start < vocab_size:
-        kept_slices.append(slice(start, vocab_size))
-    return kept_slices
-
-
-def logsumexp_excluding(logits: torch.Tensor, excluded_token_ids: Sequence[int]) -> torch.Tensor:
-    """Compute logsumexp over vocabulary except a small set, without cloning logits.
-
-    Reducing contiguous kept slices means excluded LM-head rows are absent from
-    the autograd graph entirely; the cancellation is exact rather than relying
-    on subtracting their probability mass from a full-vocabulary reduction.
-    """
-    if not excluded_token_ids:
-        return torch.logsumexp(logits, dim=-1)
-    kept_slices = _kept_vocab_slices(logits.shape[-1], excluded_token_ids)
-    if not kept_slices:
-        raise ValueError("Cannot exclude the entire policy vocabulary")
-    kept_lse_parts = [torch.logsumexp(logits[..., kept_slice], dim=-1) for kept_slice in kept_slices]
-    return torch.logsumexp(torch.stack(kept_lse_parts, dim=-1), dim=-1)
-
-
-def masked_policy_logprobs_and_entropy(
+def mask_arq_policy_logits_(
     logits: torch.Tensor,
-    labels: torch.Tensor,
     excluded_token_ids: Iterable[int],
-    calculate_entropy: bool = False,
-) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-    """Selected-token log-probs and entropy with ARQ tokens removed.
+) -> torch.Tensor:
+    """Exclude ARQ value tokens from the policy distribution in-place.
 
-    This is equivalent to setting the excluded vocabulary logits to -inf, but
-    avoids allocating a second full logits tensor.  Entropy still requires a
-    full-vocabulary softmax, as does the regular PPO entropy implementation.
+    V/Q logits must be gathered before calling this function.  Using the
+    finite dtype minimum (rather than ``-inf``) makes the excluded softmax
+    probabilities underflow to exactly zero while keeping the standard PPO
+    entropy expression free of ``0 * -inf`` NaNs.  The in-place mask lets ARQ
+    reuse the regular fused cross-entropy and compiled entropy paths without
+    allocating another ``[..., vocab_size]`` tensor.
     """
-    excluded_token_ids = tuple(int(token_id) for token_id in excluded_token_ids)
-    if any(token_id < 0 or token_id >= logits.shape[-1] for token_id in excluded_token_ids):
+    if not logits.is_floating_point():
+        raise TypeError(f"ARQ policy logits must be floating point, got {logits.dtype}")
+
+    excluded = tuple(dict.fromkeys(int(token_id) for token_id in excluded_token_ids))
+    if not excluded:
+        return logits
+    if any(token_id < 0 or token_id >= logits.shape[-1] for token_id in excluded):
         raise ValueError("An excluded ARQ token ID is outside the model vocabulary")
-    kept_lse = logsumexp_excluding(logits, excluded_token_ids)
-    selected_logits = torch.gather(logits, dim=-1, index=labels.unsqueeze(-1)).squeeze(-1)
-    log_probs = selected_logits - kept_lse
-    sampled_excluded = torch.zeros_like(labels, dtype=torch.bool)
-    for token_id in excluded_token_ids:
-        sampled_excluded = sampled_excluded | labels.eq(token_id)
-    log_probs = log_probs.masked_fill(sampled_excluded, -torch.inf)
+    if len(excluded) >= logits.shape[-1]:
+        raise ValueError("Cannot exclude the entire policy vocabulary")
 
-    if not calculate_entropy:
-        return log_probs, None
-
-    entropy = torch.zeros_like(kept_lse)
-    for kept_slice in _kept_vocab_slices(logits.shape[-1], excluded_token_ids):
-        kept_log_probs = logits[..., kept_slice] - kept_lse.unsqueeze(-1)
-        entropy = entropy - (torch.exp(kept_log_probs) * kept_log_probs).sum(dim=-1)
-    return log_probs, entropy
+    excluded_ids = torch.as_tensor(excluded, dtype=torch.long, device=logits.device)
+    logits.index_fill_(-1, excluded_ids, torch.finfo(logits.dtype).min)
+    return logits
 
 
 def value_outputs_from_logits(

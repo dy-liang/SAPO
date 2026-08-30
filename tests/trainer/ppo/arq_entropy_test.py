@@ -14,8 +14,10 @@
 
 import pytest
 import torch
+import torch.nn.functional as F
 
-from verl.trainer.ppo.arq import masked_policy_logprobs_and_entropy
+from verl.trainer.ppo.arq import mask_arq_policy_logits_
+from verl.utils.torch_functional import entropy_from_logits
 
 
 def _reference_outputs(logits, labels, excluded_token_ids):
@@ -42,59 +44,71 @@ def _reference_outputs(logits, labels, excluded_token_ids):
 
 
 @pytest.mark.parametrize("shape", [(3, 11), (2, 3, 13)])
-def test_chunked_masked_entropy_matches_dense_reference(shape):
+def test_inplace_mask_matches_dense_exclusion_reference(shape):
     torch.manual_seed(7)
     excluded_token_ids = (2, shape[-1] - 2)
     labels = torch.randint(0, shape[-1], shape[:-1])
     for token_id in excluded_token_ids:
         labels = torch.where(labels == token_id, torch.zeros_like(labels), labels)
-    logits = torch.randn(*shape, dtype=torch.float64, requires_grad=True)
-    reference_logits = logits.detach().clone().requires_grad_(True)
 
-    actual_log_probs, actual_entropy = masked_policy_logprobs_and_entropy(
-        logits=logits,
-        labels=labels,
-        excluded_token_ids=excluded_token_ids,
-        calculate_entropy=True,
-        entropy_vocab_chunk_size=3,
-    )
+    original_logits = torch.randn(*shape, dtype=torch.float64)
+    policy_logits = original_logits.clone()
+    mask_arq_policy_logits_(policy_logits, excluded_token_ids)
+    actual_log_probs = F.log_softmax(policy_logits, dim=-1).gather(
+        -1, labels.unsqueeze(-1)
+    ).squeeze(-1)
+    actual_entropy = entropy_from_logits(policy_logits)
     expected_log_probs, expected_entropy = _reference_outputs(
-        reference_logits, labels, excluded_token_ids
+        original_logits, labels, excluded_token_ids
     )
 
     torch.testing.assert_close(actual_log_probs, expected_log_probs)
     torch.testing.assert_close(actual_entropy, expected_entropy)
-
-    weights = torch.linspace(
-        0.25, 1.25, actual_entropy.numel(), dtype=torch.float64
-    ).reshape_as(actual_entropy)
-    (actual_log_probs.sum() + (actual_entropy * weights).sum()).backward()
-    (expected_log_probs.sum() + (expected_entropy * weights).sum()).backward()
-    torch.testing.assert_close(logits.grad, reference_logits.grad)
+    assert torch.isfinite(actual_entropy).all()
 
 
-def test_chunked_masked_entropy_has_zero_reserved_token_gradient():
-    logits = torch.randn(4, 17, dtype=torch.float32, requires_grad=True)
-    _, entropy = masked_policy_logprobs_and_entropy(
-        logits=logits,
-        labels=torch.tensor([0, 1, 3, 4]),
-        excluded_token_ids=(2, 13),
-        calculate_entropy=True,
-        entropy_vocab_chunk_size=4,
-    )
-    entropy.sum().backward()
+def test_inplace_mask_has_zero_policy_gradient_for_value_tokens():
+    base_logits = torch.randn(4, 17, dtype=torch.float64, requires_grad=True)
+    policy_logits = base_logits * 1.0  # non-leaf, matching model output semantics
+    excluded_token_ids = (2, 13)
+    labels = torch.tensor([0, 1, 3, 4])
 
-    torch.testing.assert_close(logits.grad[:, 2], torch.zeros(4))
-    torch.testing.assert_close(logits.grad[:, 13], torch.zeros(4))
-    assert torch.isfinite(logits.grad).all()
+    mask_arq_policy_logits_(policy_logits, excluded_token_ids)
+    log_probs = F.log_softmax(policy_logits, dim=-1).gather(
+        -1, labels.unsqueeze(-1)
+    ).squeeze(-1)
+    (log_probs.sum() + entropy_from_logits(policy_logits).sum()).backward()
+
+    torch.testing.assert_close(base_logits.grad[:, 2], torch.zeros(4, dtype=torch.float64))
+    torch.testing.assert_close(base_logits.grad[:, 13], torch.zeros(4, dtype=torch.float64))
+    assert torch.isfinite(base_logits.grad).all()
 
 
-def test_chunked_masked_entropy_rejects_nonpositive_chunk_size():
-    with pytest.raises(ValueError, match="chunk size must be positive"):
-        masked_policy_logprobs_and_entropy(
-            logits=torch.randn(2, 7),
-            labels=torch.tensor([0, 1]),
-            excluded_token_ids=(2, 5),
-            calculate_entropy=True,
-            entropy_vocab_chunk_size=0,
-        )
+def test_value_gradient_survives_policy_mask_without_policy_leakage():
+    base_logits = torch.randn(3, 11, dtype=torch.float64, requires_grad=True)
+    raw_logits = base_logits * 1.0
+    value_token_ids = torch.tensor([2, 9])
+    boundary_rows = torch.tensor([0, 2])
+    value_logits = raw_logits[
+        boundary_rows.unsqueeze(-1), value_token_ids.unsqueeze(0)
+    ]
+
+    # Match the actor: extract value scalars first, then reuse raw-logit
+    # storage for temperature scaling and policy masking.
+    policy_logits = raw_logits.div_(0.7)
+    mask_arq_policy_logits_(policy_logits, value_token_ids.tolist())
+    labels = torch.tensor([0, 1, 3])
+    policy_log_probs = F.log_softmax(policy_logits, dim=-1).gather(
+        -1, labels.unsqueeze(-1)
+    ).squeeze(-1)
+    (policy_log_probs.sum() + value_logits.sum()).backward()
+
+    expected_reserved_grad = torch.zeros(3, 2, dtype=torch.float64)
+    expected_reserved_grad[boundary_rows] = 1.0
+    torch.testing.assert_close(base_logits.grad[:, value_token_ids], expected_reserved_grad)
+    assert torch.isfinite(base_logits.grad).all()
+
+
+def test_inplace_mask_rejects_invalid_token_id():
+    with pytest.raises(ValueError, match="outside the model vocabulary"):
+        mask_arq_policy_logits_(torch.randn(2, 7), (2, 7))
