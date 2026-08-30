@@ -315,33 +315,8 @@ class DataParallelPPOActor(BasePPOActor):
                 # only return response part:
                 if calculate_entropy:
                     entropy = full_entropy.squeeze(-1)[:, -response_length - 1 : -1]  # (bsz, response_length)
-                log_probs = full_log_probs.squeeze(-1)[:, -response_length - 1 : -1]  # (bsz, response_length) align
-                #response_logits = full_logits[:, -response_length - 1 : -1, :]  # (bsz, response_length, vocab_size)
-                #response_ids = input_ids[:, -response_length - 1: -1]  # (bsz, response_length)
-                #response_logit = torch.gather(
-                #     response_logits,           # (bsz, response_length, vocab)
-                #     dim=2,
-                #     index=response_ids.unsqueeze(-1)  # (bsz, response_length, 1)
-                # ).squeeze(-1)                  # (bsz, response_length)
-                #response_certainty = torch.logsumexp(response_logits, dim=-1) - response_logits.mean(dim=-1) #(bsz, response_length)
-                #response_mask = attention_mask[:, -response_length:]
+                log_probs = full_log_probs.squeeze(-1)[:, -response_length - 1 : -1]
                 action_novelty = None
-                # if calculate_nov:
-                #     action_mask = create_action_mask(batch=micro_batch) # (bsz, response_length)
-                #     action_probs_sum = (action_mask * log_probs).sum(dim=-1) # (bsz, response_length)
-                #     #action_probs_sum = (action_mask * response_logit).sum(dim=-1) # (bsz, response_length)
-                #     #action_probs_sum = (action_mask * response_certainty).sum(dim=-1) # (bsz, response_length)
-                #     #action_probs_sum = (response_mask * response_certainty).sum(dim=-1) # (bsz, response_length)
-
-                #     #token_count = response_mask.sum(dim=-1) # (bsz, response_length)
-                #     token_count = action_mask.sum(dim=-1) # (bsz, response_length)
-
-                #     action_probs_mean = action_probs_sum / token_count.clamp(min=1e-6)
-                #     action_probs_mean = action_probs_mean.masked_fill(token_count != -10000, 0.0) # 0.0 -> reward hacking
-                #     # action_novelty = (action_probs_mean * self.novelty_coef).clamp(min=-self.novelty_max, max=self.novelty_max) # 0.001 0.05
-                #     action_novelty = action_probs_mean.unsqueeze(-1).detach()
-                #     #print(action_novelty)
-
             else:  # not using rmpad and no ulysses sp
                 extra_args = {}
                 if self.use_fused_kernels:
