@@ -95,6 +95,7 @@ class AdvantageEstimator(str, Enum):
     GRPO_PASSK = "grpo_passk"
     GiGPO = 'gigpo'
     ARQ_PPO = "arq_ppo"
+    PPO_TURN_GAE = "ppo_turn_gae"
 
 
 @dataclass
@@ -272,7 +273,7 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
     # TODO: add other ways to estimate advantages
     if adv_estimator == AdvantageEstimator.GAE:
         advantages, returns = core_algos.compute_gae_advantage_return(
-            token_level_rewards=data.batch["ppo_len_shape_rewards"], #data.batch["token_level_rewards"], ppo_len_shape_rewards
+            token_level_rewards=data.batch["token_level_rewards"], #data.batch["token_level_rewards"], ppo_len_shape_rewards
             values=data.batch["values"],
             response_mask=data.batch["response_mask"],
             gamma=gamma,
@@ -400,6 +401,46 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
         data.batch["grpo_advantages"] = advantages
         data.batch["step_len_advantages"] = advantages
         data.batch["token_len_advantages"] = advantages
+    elif adv_estimator == AdvantageEstimator.PPO_TURN_GAE:
+        ppo_turn_config = kwargs["ppo_turn_gae_config"]
+        action_valid = np.asarray(data.non_tensor_batch["is_action_valid"], dtype=bool)
+        invalid_action_mask = torch.as_tensor(
+            np.logical_not(action_valid),
+            dtype=torch.float32,
+            device=data.batch["values"].device,
+        )
+        ppo_turn_result = core_algos.compute_ppo_turn_gae_advantage_return(
+            rewards=data.batch["env_reward"],
+            dones=data.batch["done"],
+            # DataParallelPPOCritic returns values for positions
+            # [-response_length - 1 : -1]. Column zero is therefore the last
+            # prompt token, i.e. the pre-action V(s_t) boundary used by ARQ.
+            old_values=data.batch["values"][:, 0],
+            response_mask=data.batch["response_mask"],
+            trajectory_ids=data.non_tensor_batch["traj_uid"],
+            turn_indices=data.batch["turn_index"],
+            gamma=float(gamma),
+            lam=float(lam),
+            unique_turn_mask=data.batch.get("ppo_turn_unique_mask"),
+            invalid_action_mask=invalid_action_mask,
+            invalid_action_penalty_coef=float(kwargs.get("invalid_action_penalty_coef", 0.0)),
+            normalize=bool(ppo_turn_config.get("normalize_turn_advantage", True)),
+        )
+        data.batch["advantages"] = ppo_turn_result["advantages"]
+        data.batch["returns"] = ppo_turn_result["returns"]
+        data.batch["grpo_advantages"] = ppo_turn_result["advantages"]
+        data.batch["step_len_advantages"] = ppo_turn_result["advantages"]
+        data.batch["token_len_advantages"] = ppo_turn_result["advantages"]
+        data.batch["ppo_turn_old_values"] = ppo_turn_result["old_values"]
+        data.batch["ppo_turn_advantages"] = ppo_turn_result["turn_advantages"]
+        data.batch["ppo_turn_raw_advantages"] = ppo_turn_result["raw_turn_advantages"]
+        data.batch["ppo_turn_gae_advantages"] = ppo_turn_result["gae_advantages"]
+        data.batch["ppo_turn_td_errors"] = ppo_turn_result["td_errors"]
+        data.batch["ppo_turn_value_targets"] = ppo_turn_result["value_targets"]
+        data.batch["ppo_turn_unique_mask"] = ppo_turn_result["unique_turn_mask"]
+        data.batch["ppo_turn_policy_mask"] = ppo_turn_result["policy_mask"]
+        data.batch["ppo_turn_value_mask"] = ppo_turn_result["value_mask"]
+        data.batch["ppo_turn_truncated"] = ppo_turn_result["truncated"]
     elif adv_estimator == AdvantageEstimator.ARQ_PPO:
         arq_config = kwargs["arq_config"]
         action_valid = np.asarray(data.non_tensor_batch["is_action_valid"], dtype=bool)
@@ -550,7 +591,10 @@ class RayPPOTrainer:
         if config.algorithm.use_kl_in_reward:
             self.kl_ctrl_in_reward = core_algos.get_kl_controller(config.algorithm.kl_ctrl)
 
-        if self.config.algorithm.adv_estimator == AdvantageEstimator.GAE:
+        if self.config.algorithm.adv_estimator in [
+            AdvantageEstimator.GAE,
+            AdvantageEstimator.PPO_TURN_GAE,
+        ]:
             self.use_critic = True
         elif self.config.algorithm.adv_estimator in [
             AdvantageEstimator.GRPO,
@@ -728,6 +772,47 @@ class RayPPOTrainer:
                 arq.negative_token is not None or arq.negative_token_id is not None
             ), "Configure an ARQ negative token or token ID"
             assert arq.exclude_value_tokens_from_policy, "ARQ value tokens must be excluded from policy support"
+
+        if config.algorithm.adv_estimator == AdvantageEstimator.PPO_TURN_GAE:
+            assert config.actor_rollout_ref.actor.strategy in ["fsdp", "fsdp2"], (
+                "PPO turn GAE currently supports FSDP/FSDP2 only"
+            )
+            assert config.critic.strategy in ["fsdp", "fsdp2"], (
+                "PPO turn GAE currently supports an FSDP/FSDP2 critic only"
+            )
+            assert config.actor_rollout_ref.rollout.n == 1, (
+                "PPO turn GAE requires actor_rollout_ref.rollout.n=1"
+            )
+            assert config.env.rollout.n == 1, "PPO turn GAE requires env.rollout.n=1"
+            assert config.actor_rollout_ref.actor.ppo_epochs == 1, (
+                "PPO turn GAE comparison requires ppo_epochs=1"
+            )
+            assert not config.actor_rollout_ref.actor.use_dynamic_bsz, (
+                "PPO turn GAE currently requires static actor batches"
+            )
+            assert not config.critic.use_dynamic_bsz, (
+                "PPO turn GAE currently requires static critic batches"
+            )
+            assert config.actor_rollout_ref.actor.ulysses_sequence_parallel_size == 1, (
+                "PPO turn GAE currently does not support actor Ulysses sequence parallelism"
+            )
+            assert config.critic.ulysses_sequence_parallel_size == 1, (
+                "PPO turn GAE currently does not support critic Ulysses sequence parallelism"
+            )
+            assert config.actor_rollout_ref.actor.loss_agg_mode == "token-mean", (
+                "PPO turn GAE duplicate masking requires actor.loss_agg_mode=token-mean"
+            )
+            assert config.critic.loss_agg_mode == "token-mean", (
+                "PPO turn GAE duplicate masking requires critic.loss_agg_mode=token-mean"
+            )
+            assert not config.algorithm.use_kl_in_reward, (
+                "PPO turn GAE keeps KL in the policy loss and env_reward as the value target"
+            )
+            assert 0 <= config.algorithm.gamma <= 1
+            assert 0 <= config.algorithm.lam <= 1
+            assert not config.algorithm.filter_groups.enable, (
+                "PPO turn GAE does not use group filtering"
+            )
 
         print("[validate_config] All configuration checks passed successfully!")
 
@@ -1302,7 +1387,35 @@ class RayPPOTrainer:
                             device=batch.batch["turn_index"].device,
                         )
 
+                    if self.config.algorithm.adv_estimator == AdvantageEstimator.PPO_TURN_GAE:
+                        # adjust_batch appends shape-only copies. Mark one PPO
+                        # canonical row per environment transition before
+                        # balance_batch reorders the full DataProto.
+                        seen_turns = set()
+                        unique_turn_rows = []
+                        turn_indices = batch.batch["turn_index"].detach().cpu().tolist()
+                        for trajectory_id, turn_index in zip(
+                            batch.non_tensor_batch["traj_uid"], turn_indices
+                        ):
+                            key = (str(trajectory_id), int(turn_index))
+                            unique_turn_rows.append(key not in seen_turns)
+                            seen_turns.add(key)
+                        batch.batch["ppo_turn_unique_mask"] = torch.tensor(
+                            unique_turn_rows,
+                            dtype=torch.bool,
+                            device=batch.batch["turn_index"].device,
+                        )
+
                     batch.batch["response_mask"] = compute_response_mask(batch)
+                    if self.config.algorithm.adv_estimator == AdvantageEstimator.PPO_TURN_GAE:
+                        unique_turn_mask = batch.batch["ppo_turn_unique_mask"]
+                        response_mask = batch.batch["response_mask"].bool()
+                        batch.batch["ppo_turn_policy_mask"] = (
+                            response_mask & unique_turn_mask.unsqueeze(-1)
+                        )
+                        value_mask = torch.zeros_like(response_mask)
+                        value_mask[:, 0] = unique_turn_mask
+                        batch.batch["ppo_turn_value_mask"] = value_mask
                     # balance the number of valid tokens on each dp rank.
                     # Note that this breaks the order of data inside the batch.
                     # Please take care when you implement group based adv computation such as GRPO and rloo
@@ -1317,7 +1430,9 @@ class RayPPOTrainer:
                     with _timer("old_log_prob", timing_raw):
                         old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
                         entropys = old_log_prob.batch["entropys"]
-                        response_masks = batch.batch["response_mask"]
+                        response_masks = batch.batch.get(
+                            "ppo_turn_policy_mask", batch.batch["response_mask"]
+                        )
 
                         #action_novelty = action_novelty - action_novelty.mean() # (bzs,1)
                         loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
@@ -1343,7 +1458,10 @@ class RayPPOTrainer:
                             attention_mask = batch.batch["attention_mask"]
                             responses = batch.batch["responses"]
                             response_length = responses.size(1)
-                            response_mask = attention_mask[:, -response_length:]
+                            response_mask = batch.batch.get(
+                                "ppo_turn_policy_mask",
+                                attention_mask[:, -response_length:],
+                            )
 
                             rollout_probs = torch.exp(rollout_old_log_probs)
                             actor_probs = torch.exp(actor_old_log_probs)
@@ -1418,6 +1536,14 @@ class RayPPOTrainer:
                                     batch.non_tensor_batch['is_action_valid'].astype(np.float32)
                                 ).item()
                                 metrics.update({'episode/valid_action_ratio': valid_action_ratio})
+                            elif self.config.algorithm.adv_estimator == AdvantageEstimator.PPO_TURN_GAE:
+                                # PPO turn GAE likewise keeps invalid-action
+                                # shaping out of rewards and critic targets; it
+                                # is applied to the policy advantage only.
+                                valid_action_ratio = np.mean(
+                                    batch.non_tensor_batch['is_action_valid'].astype(np.float32)
+                                ).item()
+                                metrics.update({'episode/valid_action_ratio': valid_action_ratio})
                             else:
                                 batch, invalid_metrics = apply_invalid_action_penalty(
                                     batch,
@@ -1456,6 +1582,7 @@ class RayPPOTrainer:
                             mix_adv_type=self.mix_adv_type,
                             epoch=epoch,
                             arq_config=self.config.algorithm.arq,
+                            ppo_turn_gae_config=self.config.algorithm.get("ppo_turn_gae", {}),
                             global_step=self.global_steps,
                             total_training_steps=self.total_training_steps,
                             invalid_action_penalty_coef=(

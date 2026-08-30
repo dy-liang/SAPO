@@ -184,6 +184,9 @@ class DataParallelPPOCritic(BasePPOCritic):
         metrics = {}
 
         select_keys = ["input_ids", "responses", "attention_mask", "position_ids", "values", "returns"]
+        use_ppo_turn_value_mask = "ppo_turn_value_mask" in data.batch
+        if use_ppo_turn_value_mask:
+            select_keys.append("ppo_turn_value_mask")
         batch = data.select(batch_keys=select_keys).batch
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
 
@@ -224,9 +227,28 @@ class DataParallelPPOCritic(BasePPOCritic):
                     returns = data["returns"]
                     response_length = responses.size(1)
 
-                    response_mask = attention_mask[:, -response_length - 1 : -1]
+                    if use_ppo_turn_value_mask:
+                        # Column zero of vpreds/values is the last prompt token
+                        # (the pre-action V(s_t) boundary). No action-prefix
+                        # critic positions are trained for this baseline.
+                        response_mask = data["ppo_turn_value_mask"].to(
+                            device=attention_mask.device,
+                            dtype=attention_mask.dtype,
+                        )
+                    else:
+                        response_mask = attention_mask[:, -response_length - 1 : -1]
 
                     vpreds = self._forward_micro_batch(data)
+
+                    if use_ppo_turn_value_mask:
+                        # Restrict the regression tensors themselves, not only
+                        # the final reduction mask. This avoids evaluating
+                        # irrelevant action-prefix squared errors (where a
+                        # masked Inf could otherwise become 0 * Inf -> NaN).
+                        vpreds = vpreds[:, :1]
+                        values = values[:, :1]
+                        returns = returns[:, :1]
+                        response_mask = response_mask[:, :1]
 
                     # assert not torch.any(torch.isnan(vpreds)).item()
 

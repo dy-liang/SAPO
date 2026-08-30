@@ -260,6 +260,10 @@ algorithm:
     mode: "mean_norm" # "mean_norm" or "mean_std_norm"
     enable_similarity: False # whether to use similarity-based anchor state grouping in GiGPO (supported for text-only tasks)
     similarity_thresh: 0.95 # similarity threshold for GiGPO (0.0, 1.0)
+  # Turn-level GAE baseline with the standard independent scalar-head critic.
+  # This node is read only when adv_estimator=ppo_turn_gae.
+  ppo_turn_gae:
+    normalize_turn_advantage: True
   # Autoregressive Actor-Q PPO. This node is copied into the FSDP actor worker
   # only when adv_estimator=arq_ppo, so PPO/GRPO defaults are unaffected.
   arq:

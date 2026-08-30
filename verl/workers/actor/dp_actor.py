@@ -490,6 +490,9 @@ class DataParallelPPOActor(BasePPOActor):
         multi_turn = data.meta_info.get("multi_turn", False)
 
         select_keys = ["responses", "input_ids", "attention_mask", "position_ids", "old_log_probs", "advantages"]
+        use_ppo_turn_policy_mask = "ppo_turn_policy_mask" in data.batch
+        if use_ppo_turn_policy_mask:
+            select_keys.append("ppo_turn_policy_mask")
         if self.arq_enabled:
             select_keys.extend(
                 [
@@ -544,7 +547,15 @@ class DataParallelPPOActor(BasePPOActor):
                     responses = data["responses"]
                     response_length = responses.size(1)
                     attention_mask = data["attention_mask"]
-                    if multi_turn:
+                    if use_ppo_turn_policy_mask:
+                        # PPO turn GAE broadcasts one turn advantage over the
+                        # response, while excluding adjust_batch copies from
+                        # policy, entropy, and reference-KL gradients.
+                        response_mask = data["ppo_turn_policy_mask"].to(
+                            device=attention_mask.device,
+                            dtype=attention_mask.dtype,
+                        )
+                    elif multi_turn:
                         response_mask = data["loss_mask"][:, -response_length:]
                     else:
                         response_mask = attention_mask[:, -response_length:]

@@ -113,24 +113,47 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> Dict[str,
 
     prompt_mask = batch.batch["attention_mask"][:, :-max_response_length].bool()
     response_mask = batch.batch["attention_mask"][:, -max_response_length:].bool()
+    ppo_turn_unique_mask = batch.batch.get("ppo_turn_unique_mask")
+    if ppo_turn_unique_mask is not None:
+        ppo_turn_unique_mask = ppo_turn_unique_mask.bool()
+        policy_metric_mask = batch.batch["ppo_turn_policy_mask"].bool()
+        value_metric_mask = batch.batch["ppo_turn_value_mask"].bool()
+        # Report the reward actually used by the new estimator, rather than
+        # the unrelated reward-manager tensors retained for other methods.
+        sequence_reward = batch.batch["env_reward"].to(torch.float32)
+        sequence_score = sequence_score[ppo_turn_unique_mask]
+        sequence_reward = sequence_reward[ppo_turn_unique_mask]
+    else:
+        policy_metric_mask = response_mask
+        value_metric_mask = response_mask
 
     max_prompt_length = prompt_mask.size(-1)
 
     response_info = _compute_response_info(batch)
     prompt_length = response_info["prompt_length"]
     response_length = response_info["response_length"]
+    metric_prompt_length = (
+        prompt_length[ppo_turn_unique_mask]
+        if ppo_turn_unique_mask is not None
+        else prompt_length
+    )
+    metric_response_length = (
+        response_length[ppo_turn_unique_mask]
+        if ppo_turn_unique_mask is not None
+        else response_length
+    )
 
-    valid_adv = torch.masked_select(advantages, response_mask)
-    valid_grpo_adv = torch.masked_select(grpo_advantages, response_mask)
-    valid_len_adv = torch.masked_select(len_advantages, response_mask)
-    valid_token_len_adv = torch.masked_select(token_len_advantages, response_mask)
+    valid_adv = torch.masked_select(advantages, policy_metric_mask)
+    valid_grpo_adv = torch.masked_select(grpo_advantages, policy_metric_mask)
+    valid_len_adv = torch.masked_select(len_advantages, policy_metric_mask)
+    valid_token_len_adv = torch.masked_select(token_len_advantages, policy_metric_mask)
 
-    valid_returns = torch.masked_select(returns, response_mask)
+    valid_returns = torch.masked_select(returns, value_metric_mask)
     unique_traj_uid, unique_idx = np.unique(batch.non_tensor_batch['traj_uid'], return_index=True)
 
     if use_critic:
         values = batch.batch["values"]
-        valid_values = torch.masked_select(values, response_mask)
+        valid_values = torch.masked_select(values, value_metric_mask)
         return_diff_var = torch.var(valid_returns - valid_values)
         return_var = torch.var(valid_returns)
 
@@ -176,15 +199,15 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> Dict[str,
             else {}
         ),
         # response length
-        "response_length/mean": torch.mean(response_length).detach().item(),
-        "response_length/max": torch.max(response_length).detach().item(),
-        "response_length/min": torch.min(response_length).detach().item(),
-        "response_length/clip_ratio": torch.mean(torch.eq(response_length, max_response_length).float()).detach().item(),
+        "response_length/mean": torch.mean(metric_response_length).detach().item(),
+        "response_length/max": torch.max(metric_response_length).detach().item(),
+        "response_length/min": torch.min(metric_response_length).detach().item(),
+        "response_length/clip_ratio": torch.mean(torch.eq(metric_response_length, max_response_length).float()).detach().item(),
         # prompt length
-        "prompt_length/mean": torch.mean(prompt_length).detach().item(),
-        "prompt_length/max": torch.max(prompt_length).detach().item(),
-        "prompt_length/min": torch.min(prompt_length).detach().item(),
-        "prompt_length/clip_ratio": torch.mean(torch.eq(prompt_length, max_prompt_length).float()).detach().item(),
+        "prompt_length/mean": torch.mean(metric_prompt_length).detach().item(),
+        "prompt_length/max": torch.max(metric_prompt_length).detach().item(),
+        "prompt_length/min": torch.min(metric_prompt_length).detach().item(),
+        "prompt_length/clip_ratio": torch.mean(torch.eq(metric_prompt_length, max_prompt_length).float()).detach().item(),
         # episode
         "episode/reward/mean": 
             batch.non_tensor_batch["episode_rewards"][unique_idx].mean().item(),
@@ -317,6 +340,80 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> Dict[str,
         if "arq_q_target_clipped" in batch.batch:
             metrics["arq/q_target_clip_ratio"] = (
                 batch.batch["arq_q_target_clipped"][unique_turn_mask].float().mean().detach().item()
+            )
+
+    ppo_turn_metric_keys = {
+        "ppo_turn_old_values",
+        "ppo_turn_value_targets",
+        "ppo_turn_gae_advantages",
+        "ppo_turn_raw_advantages",
+        "ppo_turn_advantages",
+        "ppo_turn_td_errors",
+        "ppo_turn_unique_mask",
+        "mc_return",
+        "env_reward",
+    }
+    if ppo_turn_metric_keys.issubset(batch.batch.keys()):
+        unique_turn_mask = batch.batch["ppo_turn_unique_mask"].bool()
+        old_values = batch.batch["ppo_turn_old_values"][unique_turn_mask].to(torch.float32)
+        value_targets = batch.batch["ppo_turn_value_targets"][unique_turn_mask].to(torch.float32)
+        gae_advantages = batch.batch["ppo_turn_gae_advantages"][unique_turn_mask].to(torch.float32)
+        raw_advantages = batch.batch["ppo_turn_raw_advantages"][unique_turn_mask].to(torch.float32)
+        normalized_advantages = batch.batch["ppo_turn_advantages"][unique_turn_mask].to(torch.float32)
+        td_errors = batch.batch["ppo_turn_td_errors"][unique_turn_mask].to(torch.float32)
+        mc_returns = batch.batch["mc_return"][unique_turn_mask].to(torch.float32)
+        env_rewards = batch.batch["env_reward"][unique_turn_mask].to(torch.float32)
+
+        def ppo_turn_correlation(lhs, rhs):
+            centered_lhs = lhs - lhs.mean()
+            centered_rhs = rhs - rhs.mean()
+            return (centered_lhs * centered_rhs).mean() / (
+                centered_lhs.std(unbiased=False) * centered_rhs.std(unbiased=False) + 1e-6
+            )
+
+        target_variance = value_targets.var(unbiased=False)
+        mc_variance = mc_returns.var(unbiased=False)
+        metrics.update(
+            {
+                "ppo_turn/old_v_mean": old_values.mean().detach().item(),
+                "ppo_turn/old_v_std": old_values.std(unbiased=False).detach().item(),
+                "ppo_turn/value_target_mean": value_targets.mean().detach().item(),
+                "ppo_turn/value_target_std": value_targets.std(unbiased=False).detach().item(),
+                "ppo_turn/gae_advantage_mean": gae_advantages.mean().detach().item(),
+                "ppo_turn/gae_advantage_std": gae_advantages.std(unbiased=False).detach().item(),
+                "ppo_turn/raw_policy_advantage_mean": raw_advantages.mean().detach().item(),
+                "ppo_turn/raw_policy_advantage_std": raw_advantages.std(unbiased=False).detach().item(),
+                "ppo_turn/normalized_advantage_mean": normalized_advantages.mean().detach().item(),
+                "ppo_turn/normalized_advantage_std": normalized_advantages.std(unbiased=False).detach().item(),
+                "ppo_turn/td_error_mean": td_errors.mean().detach().item(),
+                "ppo_turn/td_error_std": td_errors.std(unbiased=False).detach().item(),
+                "ppo_turn/env_reward_mean": env_rewards.mean().detach().item(),
+                "ppo_turn/mc_return_mean": mc_returns.mean().detach().item(),
+                "ppo_turn/v_target_correlation": ppo_turn_correlation(old_values, value_targets).detach().item(),
+                "ppo_turn/v_mc_correlation": ppo_turn_correlation(old_values, mc_returns).detach().item(),
+                "ppo_turn/v_target_mse": (old_values - value_targets).square().mean().detach().item(),
+                "ppo_turn/v_target_explained_variance": (
+                    1.0
+                    - (value_targets - old_values).var(unbiased=False)
+                    / (target_variance + 1e-5)
+                ).detach().item(),
+                "ppo_turn/v_mc_explained_variance": (
+                    1.0
+                    - (mc_returns - old_values).var(unbiased=False)
+                    / (mc_variance + 1e-5)
+                ).detach().item(),
+                "ppo_turn/duplicate_ratio": (
+                    1.0 - unique_turn_mask.float().mean()
+                ).detach().item(),
+            }
+        )
+        if "ppo_turn_truncated" in batch.batch:
+            metrics["ppo_turn/horizon_truncation_ratio"] = (
+                batch.batch["ppo_turn_truncated"][unique_turn_mask]
+                .float()
+                .mean()
+                .detach()
+                .item()
             )
     return metrics
 

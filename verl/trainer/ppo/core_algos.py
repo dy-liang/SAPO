@@ -111,6 +111,244 @@ def compute_gae_advantage_return(
     return advantages, returns
 
 
+def compute_ppo_turn_gae_advantage_return(
+    rewards: torch.Tensor,
+    dones: torch.Tensor,
+    old_values: torch.Tensor,
+    response_mask: torch.Tensor,
+    trajectory_ids: Sequence[object],
+    turn_indices: torch.Tensor,
+    gamma: float,
+    lam: float,
+    unique_turn_mask: torch.Tensor | None = None,
+    invalid_action_mask: torch.Tensor | None = None,
+    invalid_action_penalty_coef: float = 0.0,
+    normalize: bool = True,
+    epsilon: float = 1e-6,
+) -> dict[str, torch.Tensor]:
+    """Compute finite-rollout, turn-level GAE for PPO's separate critic.
+
+    Each batch row is one environment turn. ``old_values`` is the scalar
+    critic prediction at the pre-action boundary (``values[:, 0]`` in the
+    current critic layout). Rows may be shuffled and may contain shape-only
+    copies inserted by ``adjust_batch``; trajectories are therefore rebuilt
+    from ``(trajectory_id, turn_index)`` and only the explicitly marked
+    canonical row participates in recursion and normalization.
+
+    The value target is the standard lambda return ``V_old + A_GAE``. The
+    invalid-action penalty is deliberately policy-only: it is applied after
+    GAE and never changes the reward, TD error, or critic target. A final
+    non-terminal row is a finite-horizon truncation with zero bootstrap,
+    matching the rollout contract (there is no extra critic evaluation after
+    ``env.max_steps``).
+
+    Returns use two different masks:
+
+    * ``policy_mask`` broadcasts the turn advantage over valid response tokens.
+    * ``value_mask`` selects only column zero, the pre-action critic boundary.
+
+    This function is independent of ARQ-PPO and contains no Q-value or
+    reserved-token logic.
+    """
+    turn_tensors = {
+        "rewards": rewards,
+        "dones": dones,
+        "old_values": old_values,
+        "turn_indices": turn_indices,
+    }
+    if any(tensor.ndim != 1 for tensor in turn_tensors.values()):
+        shapes = {name: tuple(tensor.shape) for name, tensor in turn_tensors.items()}
+        raise ValueError(f"PPO turn GAE tensors must be one-dimensional, got {shapes}")
+
+    batch_size = rewards.shape[0]
+    if any(tensor.shape[0] != batch_size for tensor in turn_tensors.values()):
+        raise ValueError("PPO turn GAE rewards, dones, values, and turn indices must have identical lengths")
+    if len(trajectory_ids) != batch_size:
+        raise ValueError("PPO turn GAE trajectory_ids must contain one ID per batch row")
+    if response_mask.ndim != 2 or response_mask.shape[0] != batch_size:
+        raise ValueError("PPO turn GAE response_mask must have shape [turns, response_length]")
+    if response_mask.shape[1] == 0:
+        raise ValueError("PPO turn GAE requires a non-empty response dimension")
+    if invalid_action_mask is not None and invalid_action_mask.shape != rewards.shape:
+        raise ValueError("PPO turn GAE invalid_action_mask must have one value per turn")
+    if unique_turn_mask is not None and unique_turn_mask.shape != rewards.shape:
+        raise ValueError("PPO turn GAE unique_turn_mask must have one value per turn")
+
+    with torch.no_grad():
+        rewards = rewards.detach().to(torch.float32)
+        dones = dones.detach().to(device=rewards.device, dtype=torch.bool)
+        old_values = old_values.detach().to(device=rewards.device, dtype=torch.float32)
+        turn_indices = turn_indices.detach().to(device=rewards.device, dtype=torch.long)
+        response_mask = response_mask.detach().to(device=rewards.device, dtype=torch.bool)
+        if unique_turn_mask is not None:
+            unique_turn_mask = unique_turn_mask.detach().to(device=rewards.device, dtype=torch.bool)
+        if invalid_action_mask is not None:
+            invalid_action_mask = invalid_action_mask.detach().to(device=rewards.device, dtype=torch.float32)
+
+        finite_tensors = {"rewards": rewards, "old_values": old_values}
+        if invalid_action_mask is not None:
+            finite_tensors["invalid_action_mask"] = invalid_action_mask
+        for name, tensor in finite_tensors.items():
+            if not torch.all(torch.isfinite(tensor)):
+                raise ValueError(f"PPO turn GAE {name} contains NaN or Inf")
+        if torch.any(response_mask.sum(dim=-1) == 0):
+            raise ValueError("PPO turn GAE requires every turn to contain at least one response token")
+
+        # Build a PPO-owned trajectory index. This intentionally does not call
+        # or share ARQ's target implementation.
+        key_to_rows: dict[tuple[str, int], list[int]] = defaultdict(list)
+        trajectory_to_keys: dict[str, list[tuple[int, tuple[str, int]]]] = defaultdict(list)
+        for row, (trajectory_id, turn_index) in enumerate(zip(trajectory_ids, turn_indices.tolist())):
+            key_to_rows[(str(trajectory_id), int(turn_index))].append(row)
+
+        canonical_rows: list[int] = []
+        key_to_canonical: dict[tuple[str, int], int] = {}
+        for key, rows in key_to_rows.items():
+            if unique_turn_mask is None:
+                canonical_row = rows[0]
+            else:
+                canonical_candidates = [row for row in rows if bool(unique_turn_mask[row].item())]
+                if len(canonical_candidates) != 1:
+                    raise ValueError(
+                        f"PPO turn GAE turn {key} must have exactly one canonical row, "
+                        f"got {len(canonical_candidates)}"
+                    )
+                canonical_row = canonical_candidates[0]
+
+            key_to_canonical[key] = canonical_row
+            canonical_rows.append(canonical_row)
+            trajectory_to_keys[key[0]].append((key[1], key))
+
+            for duplicate_row in rows:
+                if duplicate_row == canonical_row:
+                    continue
+                # Recomputed old values can differ slightly across distributed
+                # BF16 micro-batches. Validate only immutable transition data.
+                for name, tensor in {
+                    "rewards": rewards,
+                    "dones": dones,
+                    "turn_indices": turn_indices,
+                    "response_mask": response_mask,
+                }.items():
+                    lhs = tensor[canonical_row]
+                    rhs = tensor[duplicate_row]
+                    if tensor.dtype.is_floating_point:
+                        agrees = torch.all(torch.isclose(lhs, rhs, rtol=1e-5, atol=1e-6))
+                    else:
+                        agrees = torch.all(lhs == rhs)
+                    if not bool(agrees.item()):
+                        raise ValueError(f"PPO turn GAE duplicate turn {key} disagrees on {name}")
+                if invalid_action_mask is not None and not bool(
+                    torch.isclose(
+                        invalid_action_mask[canonical_row],
+                        invalid_action_mask[duplicate_row],
+                        rtol=0.0,
+                        atol=0.0,
+                    ).item()
+                ):
+                    raise ValueError(f"PPO turn GAE duplicate turn {key} disagrees on invalid_action_mask")
+
+        gae_advantages = torch.zeros_like(rewards)
+        td_errors = torch.zeros_like(rewards)
+        value_targets = torch.zeros_like(rewards)
+        truncated = torch.zeros_like(dones)
+
+        for trajectory_id, indexed_keys in trajectory_to_keys.items():
+            indexed_keys.sort(key=lambda item: item[0])
+            if indexed_keys[0][0] != 0:
+                raise ValueError(
+                    f"PPO turn GAE trajectory {trajectory_id!r} must start at turn 0, "
+                    f"got {indexed_keys[0][0]}"
+                )
+            for position in range(1, len(indexed_keys)):
+                previous_turn = indexed_keys[position - 1][0]
+                current_turn = indexed_keys[position][0]
+                if current_turn != previous_turn + 1:
+                    raise ValueError(
+                        f"PPO turn GAE trajectory {trajectory_id!r} has non-contiguous turns "
+                        f"{previous_turn} and {current_turn}"
+                    )
+
+            next_gae = torch.zeros((), dtype=torch.float32, device=rewards.device)
+            for position in range(len(indexed_keys) - 1, -1, -1):
+                _, key = indexed_keys[position]
+                row = key_to_canonical[key]
+                has_successor = position + 1 < len(indexed_keys)
+                is_done = bool(dones[row].item())
+                if is_done and has_successor:
+                    raise ValueError(f"PPO turn GAE terminal turn {key} unexpectedly has a successor")
+
+                if has_successor:
+                    next_key = indexed_keys[position + 1][1]
+                    next_row = key_to_canonical[next_key]
+                    next_value = old_values[next_row]
+                    continuation = 1.0
+                else:
+                    next_value = torch.zeros((), dtype=torch.float32, device=rewards.device)
+                    continuation = 0.0
+                    truncated[row] = not is_done
+
+                td_target = rewards[row] + gamma * continuation * next_value
+                td_error = td_target - old_values[row]
+                gae = td_error + gamma * lam * continuation * next_gae
+
+                td_errors[row] = td_error
+                gae_advantages[row] = gae
+                value_targets[row] = old_values[row] + gae
+                next_gae = gae
+
+        resolved_unique_turn_mask = torch.zeros(batch_size, dtype=torch.bool, device=rewards.device)
+        resolved_unique_turn_mask[
+            torch.as_tensor(canonical_rows, dtype=torch.long, device=rewards.device)
+        ] = True
+
+        # Keep diagnostics defined on every row while excluding padding copies
+        # from all actor/critic gradients through the masks below.
+        for key, rows in key_to_rows.items():
+            canonical_row = key_to_canonical[key]
+            for duplicate_row in rows:
+                if duplicate_row == canonical_row:
+                    continue
+                gae_advantages[duplicate_row] = gae_advantages[canonical_row]
+                td_errors[duplicate_row] = td_errors[canonical_row]
+                value_targets[duplicate_row] = value_targets[canonical_row]
+                truncated[duplicate_row] = truncated[canonical_row]
+
+        raw_policy_advantages = gae_advantages.clone()
+        if invalid_action_mask is not None:
+            raw_policy_advantages = (
+                raw_policy_advantages - invalid_action_penalty_coef * invalid_action_mask
+            )
+
+        turn_advantages = raw_policy_advantages
+        if normalize:
+            stats_values = raw_policy_advantages[resolved_unique_turn_mask]
+            mean = stats_values.mean()
+            variance = stats_values.var(unbiased=False)
+            turn_advantages = (raw_policy_advantages - mean) * torch.rsqrt(variance + epsilon)
+
+        policy_mask = response_mask & resolved_unique_turn_mask.unsqueeze(-1)
+        value_mask = torch.zeros_like(response_mask)
+        value_mask[:, 0] = resolved_unique_turn_mask
+        token_advantages = turn_advantages.unsqueeze(-1) * policy_mask
+        token_returns = value_targets.unsqueeze(-1) * value_mask
+
+    return {
+        "advantages": token_advantages,
+        "returns": token_returns,
+        "turn_advantages": turn_advantages,
+        "raw_turn_advantages": raw_policy_advantages,
+        "gae_advantages": gae_advantages,
+        "td_errors": td_errors,
+        "value_targets": value_targets,
+        "old_values": old_values,
+        "unique_turn_mask": resolved_unique_turn_mask,
+        "policy_mask": policy_mask,
+        "value_mask": value_mask,
+        "truncated": truncated,
+    }
+
+
 def compute_arq_gae_targets(
     rewards: torch.Tensor,
     dones: torch.Tensor,
