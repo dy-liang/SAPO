@@ -23,6 +23,7 @@ from __future__ import annotations
 from typing import Iterable, Optional
 
 import torch
+import torch.nn.functional as F
 
 
 ARQ_OLD_TENSOR_KEYS = (
@@ -197,13 +198,65 @@ def padded_positions_to_unpadded_indices(
     return compact_positions
 
 
+def project_arq_boundary_logits(
+    hidden_states: torch.Tensor,
+    boundary_positions: torch.Tensor,
+    lm_head_weight: torch.Tensor,
+    value_token_ids: Iterable[int],
+    lm_head_bias: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Project only the two ARQ token rows at the V/Q boundaries.
+
+    ``hidden_states`` may be padded ``[B, S, H]`` or remove-padding
+    ``[1, total_tokens, H]``/``[total_tokens, H]``.  In the latter case,
+    ``boundary_positions`` contains compact token indices.  The result has
+    shape ``[B, 2 (V/Q), 2 (+/-)]`` and never creates a
+    ``[total_tokens, vocab_size]`` value-branch gradient.
+    """
+    if boundary_positions.ndim != 2 or boundary_positions.shape[-1] != 2:
+        raise ValueError(
+            "ARQ boundary_positions must have shape [batch, 2], got "
+            f"{tuple(boundary_positions.shape)}"
+        )
+    if lm_head_weight.ndim != 2:
+        raise ValueError(f"ARQ LM-head weight must be rank 2, got {lm_head_weight.ndim}")
+
+    token_ids = tuple(int(token_id) for token_id in value_token_ids)
+    if len(token_ids) != 2 or token_ids[0] == token_ids[1]:
+        raise ValueError("ARQ requires two distinct value token IDs")
+    if any(token_id < 0 or token_id >= lm_head_weight.shape[0] for token_id in token_ids):
+        raise ValueError("An ARQ value token ID is outside the LM-head vocabulary")
+    token_ids_tensor = torch.as_tensor(token_ids, dtype=torch.long, device=lm_head_weight.device)
+
+    if hidden_states.ndim == 3 and hidden_states.shape[0] == boundary_positions.shape[0]:
+        batch_indices = torch.arange(hidden_states.shape[0], device=hidden_states.device)
+        boundary_hidden = hidden_states[batch_indices.unsqueeze(-1), boundary_positions]
+    else:
+        if hidden_states.ndim == 3:
+            if hidden_states.shape[0] != 1:
+                raise ValueError(
+                    "Remove-padding ARQ hidden states must have leading dimension 1, got "
+                    f"{tuple(hidden_states.shape)}"
+                )
+            hidden_states = hidden_states.squeeze(0)
+        if hidden_states.ndim != 2:
+            raise ValueError(f"ARQ hidden states must be rank 2 or 3, got {hidden_states.ndim}")
+        boundary_hidden = hidden_states[boundary_positions]
+
+    selected_weight = lm_head_weight.index_select(0, token_ids_tensor)
+    selected_bias = None
+    if lm_head_bias is not None:
+        selected_bias = lm_head_bias.index_select(0, token_ids_tensor)
+    return F.linear(boundary_hidden, selected_weight, selected_bias)
+
+
 def mask_arq_policy_logits_(
     logits: torch.Tensor,
     excluded_token_ids: Iterable[int],
 ) -> torch.Tensor:
     """Exclude ARQ value tokens from the policy distribution in-place.
 
-    V/Q logits must be gathered before calling this function.  Using the
+    V/Q logits must be projected before calling this function.  Using the
     finite dtype minimum (rather than ``-inf``) makes the excluded softmax
     probabilities underflow to exactly zero while keeping the standard PPO
     entropy expression free of ``0 * -inf`` NaNs.  The in-place mask lets ARQ

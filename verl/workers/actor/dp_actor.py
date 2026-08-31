@@ -34,6 +34,7 @@ from verl.trainer.ppo.arq import (
     get_arq_boundary_positions,
     mask_arq_policy_logits_,
     padded_positions_to_unpadded_indices,
+    project_arq_boundary_logits,
     value_outputs_from_logits,
 )
 from verl.trainer.ppo.core_algos import (
@@ -124,6 +125,7 @@ class DataParallelPPOActor(BasePPOActor):
         self.arq_config = self.config.get("arq", None)
         self.arq_enabled = self.arq_config is not None and self.arq_config.get("enable", False)
         self.arq_token_ids = ()
+        self.arq_lm_head = None
         if self.arq_enabled:
             self.arq_token_ids = (
                 int(self.arq_config.positive_token_id),
@@ -133,36 +135,37 @@ class DataParallelPPOActor(BasePPOActor):
                 raise ValueError("ARQ-PPO v1 does not support fused actor kernels")
             if self.use_ulysses_sp:
                 raise ValueError("ARQ-PPO v1 does not support Ulysses sequence parallelism")
-
-    def _extract_arq_outputs(self, raw_logits, attention_mask, response_length, unpad_indices=None):
-        """Extract bounded V/Q scalars from raw next-token logits."""
-        v_positions, q_positions = get_arq_boundary_positions(attention_mask, response_length)
-        boundary_positions = torch.stack((v_positions, q_positions), dim=-1)
-        value_token_ids = torch.as_tensor(
-            self.arq_token_ids, dtype=torch.long, device=raw_logits.device
-        )
-        if unpad_indices is not None:
-            sequence_length = attention_mask.shape[1]
-            compact_positions = torch.stack(
-                (
-                    padded_positions_to_unpadded_indices(v_positions, unpad_indices, sequence_length),
-                    padded_positions_to_unpadded_indices(q_positions, unpad_indices, sequence_length),
-                ),
-                dim=-1,
+            actor_root = (
+                self.actor_module._fsdp_wrapped_module
+                if isinstance(self.actor_module, FSDP)
+                else self.actor_module
             )
-            # A single advanced-indexing branch gathers only [B, V/Q, +/-]
-            # scalars instead of copying two full [B, vocab] rows.
-            boundary_value_logits = raw_logits[
-                compact_positions.unsqueeze(-1), value_token_ids.view(1, 1, -1)
-            ]
-        else:
-            batch_indices = torch.arange(raw_logits.shape[0], device=raw_logits.device)
-            boundary_value_logits = raw_logits[
-                batch_indices.view(-1, 1, 1),
-                boundary_positions.unsqueeze(-1),
-                value_token_ids.view(1, 1, -1),
-            ]
+            get_output_embeddings = getattr(actor_root, "get_output_embeddings", None)
+            if get_output_embeddings is None:
+                raise ValueError("ARQ requires a causal LM exposing get_output_embeddings()")
+            self.arq_lm_head = get_output_embeddings()
+            if isinstance(self.arq_lm_head, FSDP):
+                self.arq_lm_head = self.arq_lm_head._fsdp_wrapped_module
+            lm_head_weight = getattr(self.arq_lm_head, "weight", None)
+            if lm_head_weight is None:
+                raise ValueError("ARQ requires a linear LM head exposing weight")
 
+    def _get_arq_boundary_positions(self, attention_mask, response_length, unpad_indices=None):
+        """Return padded or compact [B, V/Q] LM-head input positions."""
+        v_positions, q_positions = get_arq_boundary_positions(attention_mask, response_length)
+        if unpad_indices is None:
+            return torch.stack((v_positions, q_positions), dim=-1)
+        sequence_length = attention_mask.shape[1]
+        return torch.stack(
+            (
+                padded_positions_to_unpadded_indices(v_positions, unpad_indices, sequence_length),
+                padded_positions_to_unpadded_indices(q_positions, unpad_indices, sequence_length),
+            ),
+            dim=-1,
+        )
+
+    def _arq_outputs_from_boundary_logits(self, boundary_value_logits):
+        """Convert [B, V/Q, +/-] logits into bounded V/Q outputs."""
         v_logits = boundary_value_logits[:, 0]
         q_logits = boundary_value_logits[:, 1]
         v_output = value_outputs_from_logits(
@@ -185,6 +188,47 @@ class DataParallelPPOActor(BasePPOActor):
             "v_logit_gaps": v_output["logit_gaps"],
             "q_logit_gaps": q_output["logit_gaps"],
         }
+
+    def _forward_actor_with_arq(self, forward_kwargs, boundary_positions=None):
+        """Run the actor and project V/Q inside the LM-head FSDP context."""
+        if boundary_positions is None:
+            return self.actor_module(**forward_kwargs), None
+
+        captured_boundary_logits = []
+
+        def capture_lm_head_input(module, args, kwargs):
+            hidden_states = args[0] if args else kwargs.get("input")
+            if hidden_states is None:
+                hidden_states = kwargs.get("hidden_states")
+            if hidden_states is None:
+                raise RuntimeError("ARQ could not capture the LM-head hidden states")
+            captured_boundary_logits.append(
+                project_arq_boundary_logits(
+                    hidden_states=hidden_states,
+                    boundary_positions=boundary_positions,
+                    lm_head_weight=module.weight,
+                    lm_head_bias=getattr(module, "bias", None),
+                    value_token_ids=self.arq_token_ids,
+                )
+            )
+
+        hook_handle = self.arq_lm_head.register_forward_pre_hook(
+            capture_lm_head_input, with_kwargs=True
+        )
+        try:
+            output = self.actor_module(**forward_kwargs)
+        finally:
+            hook_handle.remove()
+
+        if len(captured_boundary_logits) != 1:
+            raise RuntimeError(
+                "ARQ expected exactly one LM-head call, got "
+                f"{len(captured_boundary_logits)}"
+            )
+        boundary_logits = captured_boundary_logits[0]
+        if hasattr(output, "logits"):
+            boundary_logits = boundary_logits.to(output.logits.dtype)
+        return output, self._arq_outputs_from_boundary_logits(boundary_logits)
 
     def _forward_micro_batch(self, micro_batch, temperature, calculate_entropy=False, calculate_nov=False, calculate_arq=False) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -252,13 +296,24 @@ class DataParallelPPOActor(BasePPOActor):
                     extra_args["temperature"] = temperature
                     extra_args["return_dict"] = True
 
-                output = self.actor_module(
+                forward_kwargs = dict(
                     input_ids=input_ids_rmpad, # prompt+response
                     attention_mask=None,
                     position_ids=position_ids_rmpad,
                     **multi_modal_inputs,
                     use_cache=False,
                     **extra_args,
+                )
+                arq_boundary_positions = None
+                if self.arq_enabled and calculate_arq:
+                    arq_boundary_positions = self._get_arq_boundary_positions(
+                        attention_mask=attention_mask,
+                        response_length=response_length,
+                        unpad_indices=indices,
+                    )
+                output, arq_outputs = self._forward_actor_with_arq(
+                    forward_kwargs=forward_kwargs,
+                    boundary_positions=arq_boundary_positions,
                 )  # prevent model thinks we are generating
 
                 if self.use_fused_kernels:
@@ -266,16 +321,8 @@ class DataParallelPPOActor(BasePPOActor):
                     entropy_rmpad = output.entropy.squeeze(0)  # (total_nnz,)
                 else:
                     logits_rmpad = output.logits.squeeze(0)  # (total_nnz, vocab_size)
-                    if self.arq_enabled and calculate_arq:
-                        arq_outputs = self._extract_arq_outputs(
-                            raw_logits=logits_rmpad,
-                            attention_mask=attention_mask,
-                            response_length=response_length,
-                            unpad_indices=indices,
-                        )
-                    # V/Q were gathered from raw logits above.  Reuse the same
-                    # storage for policy-temperature scaling to avoid another
-                    # [tokens, vocab] allocation.
+                    # V/Q were projected directly from boundary hidden states.
+                    # Reuse the policy-logit storage for temperature scaling.
                     policy_logits_rmpad = logits_rmpad.div_(temperature)
                     if self.arq_enabled:
                         mask_arq_policy_logits_(policy_logits_rmpad, self.arq_token_ids)
@@ -331,13 +378,23 @@ class DataParallelPPOActor(BasePPOActor):
                 extra_args = {}
                 if self.use_fused_kernels:
                     extra_args["temperature"] = temperature
-                output = self.actor_module(
+                forward_kwargs = dict(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
                     position_ids=position_ids,
                     **multi_modal_inputs,
                     use_cache=False,
                     **extra_args,
+                )
+                arq_boundary_positions = None
+                if self.arq_enabled and calculate_arq:
+                    arq_boundary_positions = self._get_arq_boundary_positions(
+                        attention_mask=attention_mask,
+                        response_length=response_length,
+                    )
+                output, arq_outputs = self._forward_actor_with_arq(
+                    forward_kwargs=forward_kwargs,
+                    boundary_positions=arq_boundary_positions,
                 )  # prevent model thinks we are generating
 
                 if self.use_fused_kernels:
@@ -346,14 +403,8 @@ class DataParallelPPOActor(BasePPOActor):
 
                 else:
                     raw_logits = output.logits
-                    if self.arq_enabled and calculate_arq:
-                        arq_outputs = self._extract_arq_outputs(
-                            raw_logits=raw_logits,
-                            attention_mask=attention_mask,
-                            response_length=response_length,
-                        )
-                    # Boundary values have already been copied out of the raw
-                    # tensor, so policy scaling can safely reuse logits storage.
+                    # Boundary values were projected from hidden states, so
+                    # policy scaling can safely reuse the logits storage.
                     policy_logits = raw_logits.div_(temperature)
                     if self.arq_enabled:
                         mask_arq_policy_logits_(policy_logits, self.arq_token_ids)

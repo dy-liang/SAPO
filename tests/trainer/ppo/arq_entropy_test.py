@@ -16,7 +16,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from verl.trainer.ppo.arq import mask_arq_policy_logits_
+from verl.trainer.ppo.arq import mask_arq_policy_logits_, project_arq_boundary_logits
 from verl.utils.torch_functional import entropy_from_logits
 
 
@@ -84,29 +84,64 @@ def test_inplace_mask_has_zero_policy_gradient_for_value_tokens():
     assert torch.isfinite(base_logits.grad).all()
 
 
-def test_value_gradient_survives_policy_mask_without_policy_leakage():
-    base_logits = torch.randn(3, 11, dtype=torch.float64, requires_grad=True)
-    raw_logits = base_logits * 1.0
-    value_token_ids = torch.tensor([2, 9])
-    boundary_rows = torch.tensor([0, 2])
-    value_logits = raw_logits[
-        boundary_rows.unsqueeze(-1), value_token_ids.unsqueeze(0)
-    ]
+@pytest.mark.parametrize("remove_padding", [False, True])
+def test_boundary_projection_matches_full_lm_head(remove_padding):
+    torch.manual_seed(11)
+    hidden_states = torch.randn(2, 5, 7, dtype=torch.float64)
+    boundary_positions = torch.tensor([[1, 4], [0, 3]])
+    if remove_padding:
+        hidden_states = hidden_states.reshape(1, 10, 7)
+        boundary_positions = torch.tensor([[1, 4], [5, 8]])
+    weight = torch.randn(13, 7, dtype=torch.float64)
+    bias = torch.randn(13, dtype=torch.float64)
+    value_token_ids = (2, 11)
 
-    # Match the actor: extract value scalars first, then reuse raw-logit
-    # storage for temperature scaling and policy masking.
-    policy_logits = raw_logits.div_(0.7)
-    mask_arq_policy_logits_(policy_logits, value_token_ids.tolist())
-    labels = torch.tensor([0, 1, 3])
-    policy_log_probs = F.log_softmax(policy_logits, dim=-1).gather(
-        -1, labels.unsqueeze(-1)
-    ).squeeze(-1)
-    (policy_log_probs.sum() + value_logits.sum()).backward()
+    actual = project_arq_boundary_logits(
+        hidden_states=hidden_states,
+        boundary_positions=boundary_positions,
+        lm_head_weight=weight,
+        lm_head_bias=bias,
+        value_token_ids=value_token_ids,
+    )
+    full_logits = F.linear(hidden_states, weight, bias)
+    if remove_padding:
+        full_logits = full_logits.squeeze(0)
+        expected = full_logits[
+            boundary_positions.unsqueeze(-1),
+            torch.tensor(value_token_ids).view(1, 1, -1),
+        ]
+    else:
+        batch_indices = torch.arange(hidden_states.shape[0]).view(-1, 1, 1)
+        expected = full_logits[
+            batch_indices,
+            boundary_positions.unsqueeze(-1),
+            torch.tensor(value_token_ids).view(1, 1, -1),
+        ]
+    torch.testing.assert_close(actual, expected)
 
-    expected_reserved_grad = torch.zeros(3, 2, dtype=torch.float64)
-    expected_reserved_grad[boundary_rows] = 1.0
-    torch.testing.assert_close(base_logits.grad[:, value_token_ids], expected_reserved_grad)
-    assert torch.isfinite(base_logits.grad).all()
+
+def test_boundary_projection_gradients_are_sparse_in_token_and_sequence_axes():
+    hidden_states = torch.randn(2, 5, 7, dtype=torch.float64, requires_grad=True)
+    weight = torch.randn(13, 7, dtype=torch.float64, requires_grad=True)
+    boundary_positions = torch.tensor([[1, 4], [0, 3]])
+    value_token_ids = (2, 11)
+
+    projected = project_arq_boundary_logits(
+        hidden_states=hidden_states,
+        boundary_positions=boundary_positions,
+        lm_head_weight=weight,
+        value_token_ids=value_token_ids,
+    )
+    projected.sum().backward()
+
+    hidden_non_boundary = torch.ones(2, 5, dtype=torch.bool)
+    hidden_non_boundary[torch.arange(2).unsqueeze(-1), boundary_positions] = False
+    assert torch.count_nonzero(hidden_states.grad[hidden_non_boundary]) == 0
+    weight_non_value = torch.ones(13, dtype=torch.bool)
+    weight_non_value[list(value_token_ids)] = False
+    assert torch.count_nonzero(weight.grad[weight_non_value]) == 0
+    assert torch.isfinite(hidden_states.grad).all()
+    assert torch.isfinite(weight.grad).all()
 
 
 def test_inplace_mask_rejects_invalid_token_id():
