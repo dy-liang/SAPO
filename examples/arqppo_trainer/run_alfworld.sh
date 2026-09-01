@@ -10,12 +10,12 @@ pkill -f "keepgpu"
 set -x
 ENGINE=${1:-vllm}
 export VLLM_ATTENTION_BACKEND=${VLLM_ATTENTION_BACKEND:-XFORMERS}
-export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-1}
+export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
 export HF_ENDPOINT=${HF_ENDPOINT:-https://hf-mirror.com}
 
 num_cpus_per_env_worker=${NUM_CPUS_PER_ENV_WORKER:-0.02}
 train_data_size=${TRAIN_DATA_SIZE:-128}
-val_data_size=${VAL_DATA_SIZE:-128}
+val_data_size=${VAL_DATA_SIZE:-2}
 #{"td0":now, "lambda_return: with GAE", "monte_carlo", "sarsa_td0"}
 arq_q_target=${ARQ_Q_TARGET:-sarsa_td0}
 arq_q_loss_mode=${ARQ_Q_LOSS_MODE:-absolute} # train Q or Q-V
@@ -23,7 +23,7 @@ arq_advantage_mode=${ARQ_ADVANTAGE_MODE:-gae} #{"gae", "qv", "gae_qv_mix"}
 arq_q_advantage_mix_coef=${ARQ_Q_ADVANTAGE_MIX_COEF:-0.0}
 arq_q_lambda=${ARQ_Q_LAMBDA:-null}
 
-# nohup bash examples/arqppo_trainer/run_alfworld.sh > ./log/ALF_SAPO_128_QV_gae_ap1_gamlam9595_init0_t1_woQ_woNorm_s0re_wClip_hly4.log 2>&1 &
+# nohup bash examples/arqppo_trainer/run_alfworld.sh > ./log/ALF_SAPO_QV_gae_ap1_gamlam9595_init0_t1_wQ_wNorm_s3re_wClip_hly4.log 2>&1 &
 # These are single-token Qwen2.5 delimiters that are unused in a text-only
 # ALFWorld prompt. ARQ validates them at worker startup and bans them from
 # vLLM sampling and policy normalization.
@@ -75,7 +75,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.actor.ppo_mini_batch_size=256 \
-    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=16 \
+    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=32 \
     actor_rollout_ref.actor.ppo_epochs=1 \
     actor_rollout_ref.actor.use_dynamic_bsz=False \
     actor_rollout_ref.actor.ulysses_sequence_parallel_size=1 \
@@ -87,7 +87,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=False \
     actor_rollout_ref.actor.use_invalid_action_penalty=True \
     actor_rollout_ref.actor.invalid_action_penalty_coef=1.0 \
-    actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=32 \
+    actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=64 \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
     actor_rollout_ref.rollout.name="$ENGINE" \
     actor_rollout_ref.rollout.n=1 \
@@ -97,7 +97,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.free_cache_engine=False \
     actor_rollout_ref.rollout.val_kwargs.temperature=0.4 \
     actor_rollout_ref.rollout.val_kwargs.do_sample=True \
-    actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=32 \
+    actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=64 \
     actor_rollout_ref.ref.fsdp_config.param_offload=False \
     actor_rollout_ref.novelty_module.enable=False \
     env.env_name=alfworld/AlfredTWEnv \
@@ -108,13 +108,13 @@ python3 -m verl.trainer.main_ppo \
     trainer.critic_warmup=0 \
     trainer.logger="['console','wandb']" \
     trainer.project_name=verl_agent \
-    trainer.experiment_name=qwen2.5_1.5b_SAPO_Gae_QV_Ap1_gamlam9595_wQ_init0_t1_wQ_wNorm_s3_wClip_hly4 \
+    trainer.experiment_name=qwen2.5_1.5b_SAPO_Gae_QV_Ap1_gamlam9595_wQ_init0_t1_wQ_wNorm_OPT_s3_wClip_hly4 \
     trainer.n_gpus_per_node=1 \
     trainer.nnodes=1 \
     trainer.save_freq=150 \
-    trainer.test_freq=5 \
+    trainer.test_freq=-1 \
     trainer.total_epochs=150 \
-    trainer.val_before_train=True \
+    trainer.val_before_train=False \
     "$@"
 
 nohup python /home/heliyuan/project_code/keepgpu.py --gpu 0 --util 25 --memory 1000 > keep_gpu.log 2>&1 &
