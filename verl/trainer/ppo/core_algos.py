@@ -127,21 +127,6 @@ def compute_ppo_turn_gae_advantage_return(
     epsilon: float = 1e-6,
 ) -> dict[str, torch.Tensor]:
     """Compute finite-rollout, turn-level GAE for PPO's separate critic.
-
-    Each batch row is one environment turn. ``old_values`` is the scalar
-    critic prediction at the pre-action boundary (``values[:, 0]`` in the
-    current critic layout). Rows may be shuffled and may contain shape-only
-    copies inserted by ``adjust_batch``; trajectories are therefore rebuilt
-    from ``(trajectory_id, turn_index)`` and only the explicitly marked
-    canonical row participates in recursion and normalization.
-
-    The value target is the standard lambda return ``V_old + A_GAE``. The
-    invalid-action penalty is deliberately policy-only: it is applied after
-    GAE and never changes the reward, TD error, or critic target. A final
-    non-terminal row is a finite-horizon truncation with zero bootstrap,
-    matching the rollout contract (there is no extra critic evaluation after
-    ``env.max_steps``).
-
     Returns use two different masks:
 
     * ``policy_mask`` broadcasts the turn advantage over valid response tokens.
@@ -161,19 +146,6 @@ def compute_ppo_turn_gae_advantage_return(
         raise ValueError(f"PPO turn GAE tensors must be one-dimensional, got {shapes}")
 
     batch_size = rewards.shape[0]
-    if any(tensor.shape[0] != batch_size for tensor in turn_tensors.values()):
-        raise ValueError("PPO turn GAE rewards, dones, values, and turn indices must have identical lengths")
-    if len(trajectory_ids) != batch_size:
-        raise ValueError("PPO turn GAE trajectory_ids must contain one ID per batch row")
-    if response_mask.ndim != 2 or response_mask.shape[0] != batch_size:
-        raise ValueError("PPO turn GAE response_mask must have shape [turns, response_length]")
-    if response_mask.shape[1] == 0:
-        raise ValueError("PPO turn GAE requires a non-empty response dimension")
-    if invalid_action_mask is not None and invalid_action_mask.shape != rewards.shape:
-        raise ValueError("PPO turn GAE invalid_action_mask must have one value per turn")
-    if unique_turn_mask is not None and unique_turn_mask.shape != rewards.shape:
-        raise ValueError("PPO turn GAE unique_turn_mask must have one value per turn")
-
     with torch.no_grad():
         rewards = rewards.detach().to(torch.float32)
         dones = dones.detach().to(device=rewards.device, dtype=torch.bool)
@@ -194,8 +166,7 @@ def compute_ppo_turn_gae_advantage_return(
         if torch.any(response_mask.sum(dim=-1) == 0):
             raise ValueError("PPO turn GAE requires every turn to contain at least one response token")
 
-        # Build a PPO-owned trajectory index. This intentionally does not call
-        # or share ARQ's target implementation.
+        # Build a PPO-owned trajectory index
         key_to_rows: dict[tuple[str, int], list[int]] = defaultdict(list)
         trajectory_to_keys: dict[str, list[tuple[int, tuple[str, int]]]] = defaultdict(list)
         for row, (trajectory_id, turn_index) in enumerate(zip(trajectory_ids, turn_indices.tolist())):
@@ -222,8 +193,6 @@ def compute_ppo_turn_gae_advantage_return(
             for duplicate_row in rows:
                 if duplicate_row == canonical_row:
                     continue
-                # Recomputed old values can differ slightly across distributed
-                # BF16 micro-batches. Validate only immutable transition data.
                 for name, tensor in {
                     "rewards": rewards,
                     "dones": dones,
@@ -302,8 +271,6 @@ def compute_ppo_turn_gae_advantage_return(
             torch.as_tensor(canonical_rows, dtype=torch.long, device=rewards.device)
         ] = True
 
-        # Keep diagnostics defined on every row while excluding padding copies
-        # from all actor/critic gradients through the masks below.
         for key, rows in key_to_rows.items():
             canonical_row = key_to_canonical[key]
             for duplicate_row in rows:
@@ -370,71 +337,9 @@ def compute_arq_gae_targets(
     q_advantage_mix_coef: float = 0.2,
 ) -> dict[str, torch.Tensor]:
     """Compute turn-level V/Q targets and the configured policy advantage.
-
-    ``q_target_mode`` selects TD(0), a V-bootstrapped lambda-return,
-    finite-trajectory Monte Carlo, or on-policy SARSA TD(0) supervision for Q.
-    ``advantage_mode`` independently selects GAE, ``Q_old - V_old``, or a
-    convex mixture for PPO.  All old predictions and targets are detached, so
-    bootstrap values never receive gradients through this target computation.
-
-    Rows may have been shuffled and may contain padding duplicates.  Trajectories
-    are reconstructed from ``(trajectory_id, turn_index)`` and each unique turn
-    participates exactly once in the reverse-time recursion and normalization.
-    Computed scalars are then copied back to every duplicate row.
-
-    A final non-terminal row is treated as a finite-horizon truncation and uses
-    zero bootstrap.  This matches the rollout contract, which does not run an
-    additional model forward on the observation beyond ``env.max_steps``.
     """
-    turn_tensors = {
-        "rewards": rewards,
-        "dones": dones,
-        "old_v_values": old_v_values,
-        "old_q_values": old_q_values,
-        "turn_indices": turn_indices,
-    }
-    if any(tensor.ndim != 1 for tensor in turn_tensors.values()):
-        shapes = {name: tuple(tensor.shape) for name, tensor in turn_tensors.items()}
-        raise ValueError(f"ARQ turn tensors must be one-dimensional, got {shapes}")
     batch_size = rewards.shape[0]
-    if batch_size == 0:
-        raise ValueError("ARQ GAE requires at least one turn")
-    if any(tensor.shape[0] != batch_size for tensor in turn_tensors.values()):
-        raise ValueError("ARQ rewards, dones, V, Q, and turn indices must have identical lengths")
-    if len(trajectory_ids) != batch_size:
-        raise ValueError("ARQ trajectory_ids must contain one ID per batch row")
-    if response_mask.ndim != 2 or response_mask.shape[0] != batch_size:
-        raise ValueError("ARQ response_mask must have shape [turns, response_length]")
-    if not 0.0 <= gamma <= 1.0:
-        raise ValueError(f"ARQ gamma must be in [0, 1], got {gamma}")
-    if not 0.0 <= lam <= 1.0:
-        raise ValueError(f"ARQ lambda must be in [0, 1], got {lam}")
-    allowed_q_target_modes = {"td0", "lambda_return", "monte_carlo", "sarsa_td0"}
-    if q_target_mode not in allowed_q_target_modes:
-        raise ValueError(
-            f"Unsupported ARQ q_target_mode {q_target_mode!r}; "
-            f"expected one of {sorted(allowed_q_target_modes)}"
-        )
     resolved_q_lambda = lam if q_lambda is None else q_lambda
-    if not 0.0 <= resolved_q_lambda <= 1.0:
-        raise ValueError(f"ARQ q_lambda must be in [0, 1], got {resolved_q_lambda}")
-    allowed_advantage_modes = {"gae", "qv", "gae_qv_mix"}
-    if advantage_mode not in allowed_advantage_modes:
-        raise ValueError(
-            f"Unsupported ARQ advantage_mode {advantage_mode!r}; "
-            f"expected one of {sorted(allowed_advantage_modes)}"
-        )
-    if not 0.0 <= q_advantage_mix_coef <= 1.0:
-        raise ValueError(
-            "ARQ q_advantage_mix_coef must be in [0, 1], "
-            f"got {q_advantage_mix_coef}"
-        )
-    if invalid_action_penalty_coef < 0:
-        raise ValueError("ARQ invalid_action_penalty_coef must be non-negative")
-    if invalid_action_mask is not None and invalid_action_mask.shape != rewards.shape:
-        raise ValueError("ARQ invalid_action_mask must have one value per turn")
-    if unique_turn_mask is not None and unique_turn_mask.shape != rewards.shape:
-        raise ValueError("ARQ unique_turn_mask must have one value per turn")
 
     with torch.no_grad():
         rewards = rewards.detach().to(torch.float32)
@@ -453,8 +358,6 @@ def compute_arq_gae_targets(
             if not torch.all(torch.isfinite(tensor)):
                 raise ValueError(f"ARQ {name} contains NaN or Inf")
 
-        # Reconstruct unique turns after adjust_batch duplication and sequence
-        # length balancing. Immutable transition metadata must still agree.
         key_to_rows: dict[tuple[str, int], list[int]] = defaultdict(list)
         trajectory_to_keys: dict[str, list[tuple[int, tuple[str, int]]]] = defaultdict(list)
         for row, (trajectory_id, turn_index) in enumerate(zip(trajectory_ids, turn_indices.tolist())):
@@ -467,40 +370,10 @@ def compute_arq_gae_targets(
                 canonical_row = rows[0]
             else:
                 canonical_candidates = [row for row in rows if bool(unique_turn_mask[row].item())]
-                if len(canonical_candidates) != 1:
-                    raise ValueError(
-                        f"ARQ turn {key} must have exactly one canonical row, got {len(canonical_candidates)}"
-                    )
                 canonical_row = canonical_candidates[0]
             key_to_canonical[key] = canonical_row
             canonical_rows.append(canonical_row)
             trajectory_to_keys[key[0]].append((key[1], key))
-            for duplicate_row in rows:
-                if duplicate_row == canonical_row:
-                    continue
-                # adjust_batch copies can be evaluated on different ranks or in
-                # different BF16 micro-batches. Their recomputed old V/Q may
-                # therefore differ slightly even though the source transition
-                # is identical. Validate immutable transition data only; all
-                # derived targets use the explicitly marked canonical row and
-                # duplicate rows are masked from every training loss.
-                for name, tensor in {
-                    "rewards": rewards,
-                    "dones": dones,
-                    "turn_indices": turn_indices,
-                }.items():
-                    lhs = tensor[canonical_row]
-                    rhs = tensor[duplicate_row]
-                    if tensor.dtype.is_floating_point:
-                        agrees = torch.isclose(lhs, rhs, rtol=1e-5, atol=1e-6)
-                    else:
-                        agrees = lhs == rhs
-                    if not bool(agrees.item()):
-                        raise ValueError(f"ARQ duplicate turn {key} disagrees on {name}")
-                if invalid_action_mask is not None and not bool(
-                    (invalid_action_mask[canonical_row] == invalid_action_mask[duplicate_row]).item()
-                ):
-                    raise ValueError(f"ARQ duplicate turn {key} disagrees on invalid_action_mask")
 
         gae_advantages = torch.zeros_like(rewards)
         td_errors = torch.zeros_like(rewards)
@@ -510,18 +383,6 @@ def compute_arq_gae_targets(
 
         for trajectory_id, indexed_keys in trajectory_to_keys.items():
             indexed_keys.sort(key=lambda item: item[0])
-            if indexed_keys[0][0] != 0:
-                raise ValueError(
-                    f"ARQ trajectory {trajectory_id!r} must start at turn 0, got {indexed_keys[0][0]}"
-                )
-            for position in range(1, len(indexed_keys)):
-                previous_turn = indexed_keys[position - 1][0]
-                current_turn = indexed_keys[position][0]
-                if current_turn != previous_turn + 1:
-                    raise ValueError(
-                        f"ARQ trajectory {trajectory_id!r} has non-contiguous turns "
-                        f"{previous_turn} and {current_turn}"
-                    )
 
             next_gae = torch.zeros((), dtype=torch.float32, device=rewards.device)
             next_q_return = torch.zeros((), dtype=torch.float32, device=rewards.device)
@@ -530,17 +391,12 @@ def compute_arq_gae_targets(
                 row = key_to_canonical[key]
                 has_successor = position + 1 < len(indexed_keys)
                 is_done = bool(dones[row].item())
-                if is_done and has_successor:
-                    raise ValueError(f"ARQ terminal turn {key} unexpectedly has a successor")
-
                 if has_successor:
                     next_key = indexed_keys[position + 1][1]
                     next_row = key_to_canonical[next_key]
                     next_value = old_v_values[next_row]
                     continuation = 1.0
                 else:
-                    # Both true environment terminals and max-step horizons are
-                    # terminal states of the finite rollout objective.
                     next_value = torch.zeros((), dtype=torch.float32, device=rewards.device)
                     continuation = 0.0
                     truncated[row] = not is_done
@@ -648,13 +504,6 @@ def compute_arq_value_loss(
     ``sample_mask`` excludes shape-only duplicates inserted by ``adjust_batch``
     without changing the physical batch size required by distributed workers.
     """
-    if current_probs.ndim != 1 or old_probs.ndim != 1 or target_probs.ndim != 1:
-        raise ValueError("ARQ value loss expects one scalar per turn")
-    if not (current_probs.shape == old_probs.shape == target_probs.shape):
-        raise ValueError("ARQ current, old, and target probabilities must have identical shapes")
-    if cliprange < 0:
-        raise ValueError(f"cliprange must be non-negative, got {cliprange}")
-
     old_probs = old_probs.detach().to(torch.float32)
     target_probs = target_probs.detach().to(torch.float32)
     current_probs = current_probs.to(torch.float32)

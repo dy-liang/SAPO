@@ -282,8 +282,8 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns
         data.batch["grpo_advantages"] = advantages
-        data.batch["step_len_advantages"] = advantages
-        data.batch["token_len_advantages"] = advantages
+        data.batch["step_len_advantages"] = advantages # do not use
+        data.batch["token_len_advantages"] = advantages # do not use
         if kwargs.get("use_pf_ppo", False):
             data = core_algos.compute_pf_ppo_reweight_data(
                 data,
@@ -308,8 +308,8 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns
         data.batch["grpo_advantages"] = advantages
-        data.batch["step_len_advantages"] = advantages
-        data.batch["token_len_advantages"] = advantages
+        data.batch["step_len_advantages"] = advantages # do not use
+        data.batch["token_len_advantages"] = advantages # do not use
     elif adv_estimator == AdvantageEstimator.planpo:
         # TODO: test on more adv estimator type
         grpo_calculation_mask = data.batch["response_mask"]
@@ -335,8 +335,8 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns
         data.batch["grpo_advantages"] = grpo_advantages
-        data.batch["step_len_advantages"] = step_len_advantages
-        data.batch["token_len_advantages"] = token_len_advantages
+        data.batch["step_len_advantages"] = step_len_advantages # use
+        data.batch["token_len_advantages"] = token_len_advantages # use
 
     elif adv_estimator == AdvantageEstimator.GRPO_PASSK:
         advantages, returns = core_algos.compute_grpo_passk_outcome_advantage(
@@ -399,8 +399,8 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
         data.batch['advantages'] = advantages
         data.batch['returns'] = returns
         data.batch["grpo_advantages"] = advantages
-        data.batch["step_len_advantages"] = advantages
-        data.batch["token_len_advantages"] = advantages
+        data.batch["step_len_advantages"] = advantages # do not use
+        data.batch["token_len_advantages"] = advantages # do not use
     elif adv_estimator == AdvantageEstimator.PPO_TURN_GAE:
         ppo_turn_config = kwargs["ppo_turn_gae_config"]
         action_valid = np.asarray(data.non_tensor_batch["is_action_valid"], dtype=bool)
@@ -429,8 +429,8 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
         data.batch["advantages"] = ppo_turn_result["advantages"]
         data.batch["returns"] = ppo_turn_result["returns"]
         data.batch["grpo_advantages"] = ppo_turn_result["advantages"]
-        data.batch["step_len_advantages"] = ppo_turn_result["advantages"]
-        data.batch["token_len_advantages"] = ppo_turn_result["advantages"]
+        data.batch["step_len_advantages"] = ppo_turn_result["advantages"] # do not use
+        data.batch["token_len_advantages"] = ppo_turn_result["advantages"] # do not use
         data.batch["ppo_turn_old_values"] = ppo_turn_result["old_values"]
         data.batch["ppo_turn_advantages"] = ppo_turn_result["turn_advantages"]
         data.batch["ppo_turn_raw_advantages"] = ppo_turn_result["raw_turn_advantages"]
@@ -472,10 +472,10 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
         )
         data.batch["advantages"] = arq_result["advantages"]
         data.batch["returns"] = arq_result["returns"]
-        data.batch["grpo_advantages"] = arq_result["advantages"]
-        data.batch["step_len_advantages"] = arq_result["advantages"]
-        data.batch["token_len_advantages"] = arq_result["advantages"]
-        data.batch["arq_turn_advantages"] = arq_result["turn_advantages"]
+        data.batch["grpo_advantages"] = arq_result["advantages"] # do not use
+        data.batch["step_len_advantages"] = arq_result["advantages"] # do not use
+        data.batch["token_len_advantages"] = arq_result["advantages"] # do not use
+        data.batch["arq_turn_advantages"] = arq_result["turn_advantages"] 
         data.batch["arq_raw_turn_advantages"] = arq_result["raw_turn_advantages"]
         data.batch["arq_gae_advantages"] = arq_result["gae_advantages"]
         data.batch["arq_td_errors"] = arq_result["td_errors"]
