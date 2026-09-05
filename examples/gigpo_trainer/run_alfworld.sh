@@ -1,7 +1,7 @@
 set -x
 ENGINE=${1:-vllm}
 export VLLM_ATTENTION_BACKEND=XFORMERS
-export CUDA_VISIBLE_DEVICES=2 #ps -ef | grep "+logits_swtich" | grep -v grep
+export CUDA_VISIBLE_DEVICES=0
 
 num_cpus_per_env_worker=0.05 # The CPU resource allocated for each environment worker. If you want to use less CPU resources, you can decrease this value.
 
@@ -10,15 +10,10 @@ val_data_size=128
 group_size=8
 mode="mean_std_norm" # "mean_norm" or "mean_std_norm" bash examples/gigpo_trainer/run_alfworld.sh
 
-# nohup bash examples/gigpo_trainer/run_alfworld.sh > ./test_s0_0_0.0001_0.05_T-alllogits_noNorm.log 2>&1 &
-# nohup bash examples/gigpo_trainer/run_alfworld.sh > ./test_s0_2_0.001_0.05_nodet_neg_v2.log 2>&1 &
-# nohup bash examples/gigpo_trainer/run_alfworld.sh > ./test_s0_1_0.001_0.05_nodet.log 2>&1 &
-# nohup bash examples/gigpo_trainer/run_alfworld.sh > ./test_s0_0_v1_seed0.log 2>&1 & nohup bash examples/gigpo_trainer/run_alfworld.sh > ./test_gigpo_200_s1_credit_all_pos1.log 2>&1 &
-
-# python3 -m examples.data_preprocess.prepare \
-#     --mode 'text' \
-#     --train_data_size $train_data_size \
-#     --val_data_size $val_data_size
+python3 -m examples.data_preprocess.prepare \
+    --mode 'text' \
+    --train_data_size $train_data_size \
+    --val_data_size $val_data_size
 
 python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=gigpo \
@@ -63,14 +58,14 @@ python3 -m verl.trainer.main_ppo \
     algorithm.gigpo.step_advantage_w=1.0 \
     algorithm.gigpo.mode=$mode \
     env.env_name=alfworld/AlfredTWEnv \
-    env.seed=0 \
+    env.seed=3 \
     env.max_steps=50 \
     env.rollout.n=$group_size \
     env.resources_per_worker.num_cpus=$num_cpus_per_env_worker \
     trainer.critic_warmup=0 \
     trainer.logger=['console','wandb'] \
     trainer.project_name='verl_agent_alfworld' \
-    trainer.experiment_name='gigpo_qwen2.5_1.5b_128_200_s0_1_origin' \
+    trainer.experiment_name='gigpo_qwen2.5_1.5b_s3_1_origin' \
     trainer.n_gpus_per_node=1 \
     trainer.nnodes=1 \
     trainer.save_freq=-1 \

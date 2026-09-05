@@ -15,16 +15,15 @@ export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
 export HF_ENDPOINT=${HF_ENDPOINT:-https://hf-mirror.com}
 num_cpus_per_env_worker=0.05 # The CPU resource allocated for each environment worker. If you want to use less CPU resources, you can decrease this value.
 
-# nohup bash examples/ppo_trainer/run_alfworld_turn_gae.sh > ./log/ALF_run_alfworld_turn_gae_PPO_gamlam9595_Ap1_s0_hly4.log 2>&1 &
-
+# nohup bash examples/ppo_trainer/run_alfworld_turn_gae.sh > ./log/ALF_run_alfworld_turn_gae_PPO_gamlam9595_Ap1_s0.log 2>&1 &
 train_data_size=128 # match GRPO and GiGPO configuration (16 × 8)
-val_data_size=2
+val_data_size=128
 
 # We only use data preparation to indicate the modality and the data size.
-# python3 -m examples.data_preprocess.prepare \
-#     --mode 'text' \
-#     --train_data_size $train_data_size \
-#     --val_data_size $val_data_size
+python3 -m examples.data_preprocess.prepare \
+    --mode 'text' \
+    --train_data_size $train_data_size \
+    --val_data_size $val_data_size
 
 python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=ppo_turn_gae \
@@ -73,20 +72,16 @@ python3 -m verl.trainer.main_ppo \
     critic.model.fsdp_config.optimizer_offload=False \
     algorithm.use_kl_in_reward=False \
     env.env_name=alfworld/AlfredTWEnv \
-    env.seed=0 \
+    env.seed=3 \
     env.max_steps=50 \
     env.resources_per_worker.num_cpus=$num_cpus_per_env_worker \
     trainer.critic_warmup=0 \
     trainer.logger=['console','wandb'] \
     trainer.project_name='verl_agent_alfworld' \
-    trainer.experiment_name='ppo_turn_gae_qwen2.5_1.5b_s0_gamlam9595_Ap1_hly4' \
+    trainer.experiment_name='ppo_turn_gae_qwen2.5_1.5b_s3_gamlam9595_Ap1' \
     trainer.n_gpus_per_node=1 \
     trainer.nnodes=1 \
     trainer.save_freq=150 \
-    trainer.test_freq=-1 \
+    trainer.test_freq=5 \
     trainer.total_epochs=150 \
-    trainer.val_before_train=False $@
-
-
-nohup python /home/heliyuan/project_code/keepgpu.py --gpu 0 --util 25 --memory 1000 > keep_gpu.log 2>&1 &
-echo "GPU ok!!"
+    trainer.val_before_train=True $@

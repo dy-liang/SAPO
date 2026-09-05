@@ -260,12 +260,10 @@ algorithm:
     mode: "mean_norm" # "mean_norm" or "mean_std_norm"
     enable_similarity: False # whether to use similarity-based anchor state grouping in GiGPO (supported for text-only tasks)
     similarity_thresh: 0.95 # similarity threshold for GiGPO (0.0, 1.0)
-  # Turn-level GAE baseline with the standard independent scalar-head critic.
-  # This node is read only when adv_estimator=ppo_turn_gae.
+
   ppo_turn_gae:
     normalize_turn_advantage: True
-  # Autoregressive Actor-Q PPO. This node is copied into the FSDP actor worker
-  # only when adv_estimator=arq_ppo, so PPO/GRPO defaults are unaffected.
+
   arq:
     enable: False
     positive_token: null
@@ -282,7 +280,7 @@ algorithm:
     # absolute: regress Q to the selected return target.
     # advantage_residual: regress Q-stopgrad(V) to target-V_old.
     q_loss_mode: absolute
-    # gae, qv, or gae_qv_mix (the latter two are experimental).
+    # gae, qv, or gae_qv_mix.
     advantage_mode: gae
     q_advantage_mix_coef: 0.2
     # td0, lambda_return, monte_carlo, or sarsa_td0.
@@ -317,7 +315,7 @@ trainer:
   critic_warmup: 0
   default_hdfs_dir: null
   del_local_ckpt_after_load: False
-  #default_local_dir: /gpfshome/data/checkpoints-HLY2/${trainer.project_name}/${trainer.experiment_name}
+  #default_local_dir: /gpfshome/data/checkpoints/${trainer.project_name}/${trainer.experiment_name}
   default_local_dir: checkpoints/${trainer.project_name}/${trainer.experiment_name}
   max_actor_ckpt_to_keep: null
   max_critic_ckpt_to_keep: null

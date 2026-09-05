@@ -15,7 +15,7 @@ export HF_ENDPOINT=${HF_ENDPOINT:-https://hf-mirror.com}
 
 num_cpus_per_env_worker=${NUM_CPUS_PER_ENV_WORKER:-0.02}
 train_data_size=${TRAIN_DATA_SIZE:-128}
-val_data_size=${VAL_DATA_SIZE:-2}
+val_data_size=${VAL_DATA_SIZE:-128}
 #{"td0":now, "lambda_return: with GAE", "monte_carlo", "sarsa_td0"}
 arq_q_target=${ARQ_Q_TARGET:-sarsa_td0}
 arq_q_loss_mode=${ARQ_Q_LOSS_MODE:-absolute} # train Q or Q-V
@@ -24,9 +24,6 @@ arq_q_advantage_mix_coef=${ARQ_Q_ADVANTAGE_MIX_COEF:-0.0}
 arq_q_lambda=${ARQ_Q_LAMBDA:-null}
 
 # nohup bash examples/arqppo_trainer/run_alfworld.sh > ./log/ALF_SAPO_QV_gae_ap1_gamlam9595_init0_t1_wQ_wNorm_s3re_wClip_hly4.log 2>&1 &
-# These are single-token Qwen2.5 delimiters that are unused in a text-only
-# ALFWorld prompt. ARQ validates them at worker startup and bans them from
-# vLLM sampling and policy normalization.
 arq_positive_token=${ARQ_POSITIVE_TOKEN:-'<|vision_start|>'}
 arq_negative_token=${ARQ_NEGATIVE_TOKEN:-'<|vision_end|>'}
 
@@ -35,8 +32,6 @@ python3 -m examples.data_preprocess.prepare \
     --train_data_size "$train_data_size" \
     --val_data_size "$val_data_size"
 
-# Keep the inner quotes in argv so Hydra treats delimiters such as
-# <|vision_start|> as strings instead of trying to lex their pipe symbols.
 python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=arq_ppo \
     algorithm.gamma=0.95 \
@@ -112,10 +107,7 @@ python3 -m verl.trainer.main_ppo \
     trainer.n_gpus_per_node=1 \
     trainer.nnodes=1 \
     trainer.save_freq=150 \
-    trainer.test_freq=-1 \
+    trainer.test_freq=5 \
     trainer.total_epochs=150 \
-    trainer.val_before_train=False \
+    trainer.val_before_train=True \
     "$@"
-
-nohup python /home/heliyuan/project_code/keepgpu.py --gpu 0 --util 25 --memory 1000 > keep_gpu.log 2>&1 &
-echo "GPU ok!!"

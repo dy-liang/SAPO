@@ -72,6 +72,3 @@ python3 -m verl.trainer.main_ppo \
     trainer.test_freq=5 \
     trainer.total_epochs=150 \
     trainer.val_before_train=True $@
-
-nohup python /home/heliyuan/project_code/keepgpu.py --gpu 0 --util 25 --memory 1000 > keep_gpu.log 2>&1 &
-echo "GPU ok!!"

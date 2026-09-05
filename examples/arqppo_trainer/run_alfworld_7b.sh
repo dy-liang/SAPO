@@ -12,9 +12,6 @@ train_data_size=${TRAIN_DATA_SIZE:-128}
 val_data_size=${VAL_DATA_SIZE:-2}
 
 # nohup bash examples/arqppo_trainer/run_alfworld_7b.sh > ./log/test_Qwen7b_arqppo_QV_gae_ap1_vloss01_gamlam9595_init0_t1_fixPros_wQ.log 2>&1 &
-# These are single-token Qwen2.5 delimiters that are unused in a text-only
-# ALFWorld prompt. ARQ validates them at worker startup and bans them from
-# vLLM sampling and policy normalization.
 arq_positive_token=${ARQ_POSITIVE_TOKEN:-'<|vision_start|>'}
 arq_negative_token=${ARQ_NEGATIVE_TOKEN:-'<|vision_end|>'}
 
@@ -23,8 +20,6 @@ python3 -m examples.data_preprocess.prepare \
     --train_data_size "$train_data_size" \
     --val_data_size "$val_data_size"
 
-# Keep the inner quotes in argv so Hydra treats delimiters such as
-# <|vision_start|> as strings instead of trying to lex their pipe symbols.
 python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=arq_ppo \
     algorithm.gamma=0.95 \
@@ -101,6 +96,3 @@ python3 -m verl.trainer.main_ppo \
     trainer.total_epochs=150 \
     trainer.val_before_train=False \
     "$@"
-
-nohup python /home/heliyuan/project_code/keepgpu.py --gpu 0 --util 25 --memory 1000 > keep_gpu.log 2>&1 &
-echo "GPU ok!!"
