@@ -23,7 +23,7 @@ arq_advantage_mode=${ARQ_ADVANTAGE_MODE:-gae} #{"gae", "qv", "gae_qv_mix"}
 arq_q_advantage_mix_coef=${ARQ_Q_ADVANTAGE_MIX_COEF:-0.0}
 arq_q_lambda=${ARQ_Q_LAMBDA:-null}
 
-# nohup bash examples/arqppo_trainer/run_alfworld.sh > ./log/ALF_SAPO_QV_gae_ap1_gamlam9595_init0_t1_wQ_wNorm_s3re_wClip_hly4.log 2>&1 &
+# nohup bash examples/arqppo_trainer/run_alfworld.sh > ./log/ALF_SAPO_QV_gae_ap1_gamlam9595_init0_t1_wQ_wNorm_s3re_wClip.log 2>&1 &
 arq_positive_token=${ARQ_POSITIVE_TOKEN:-'<|vision_start|>'}
 arq_negative_token=${ARQ_NEGATIVE_TOKEN:-'<|vision_end|>'}
 
@@ -103,7 +103,7 @@ python3 -m verl.trainer.main_ppo \
     trainer.critic_warmup=0 \
     trainer.logger="['console','wandb']" \
     trainer.project_name=verl_agent \
-    trainer.experiment_name=qwen2.5_1.5b_SAPO_Gae_QV_Ap1_gamlam9595_wQ_init0_t1_wQ_wNorm_OPT_s3_wClip_hly4 \
+    trainer.experiment_name=qwen2.5_1.5b_SAPO_Gae_QV_Ap1_gamlam9595_wQ_init0_t1_wSARSA_wNorm_OPT_s3_wClip \
     trainer.n_gpus_per_node=1 \
     trainer.nnodes=1 \
     trainer.save_freq=150 \

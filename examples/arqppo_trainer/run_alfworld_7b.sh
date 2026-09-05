@@ -1,17 +1,29 @@
 #!/usr/bin/env bash
+pid=3743554
+echo "进程 $pid 运行中..."
+while kill -0 "$pid" 2>/dev/null; do
+    sleep 5
+done
+echo "进程 $pid 已结束"
 pkill -f "keepgpu"
+
 set -x
 ENGINE=${1:-vllm}
-export ARQ_MEMORY_COMPARE=1
 export VLLM_ATTENTION_BACKEND=${VLLM_ATTENTION_BACKEND:-XFORMERS}
-#export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-1}
+#export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
 export HF_ENDPOINT=${HF_ENDPOINT:-https://hf-mirror.com}
-#export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-num_cpus_per_env_worker=${NUM_CPUS_PER_ENV_WORKER:-0.1}
-train_data_size=${TRAIN_DATA_SIZE:-128}
-val_data_size=${VAL_DATA_SIZE:-2}
 
-# nohup bash examples/arqppo_trainer/run_alfworld_7b.sh > ./log/test_Qwen7b_arqppo_QV_gae_ap1_vloss01_gamlam9595_init0_t1_fixPros_wQ.log 2>&1 &
+num_cpus_per_env_worker=${NUM_CPUS_PER_ENV_WORKER:-0.02}
+train_data_size=${TRAIN_DATA_SIZE:-128}
+val_data_size=${VAL_DATA_SIZE:-128}
+#{"td0":now, "lambda_return: with GAE", "monte_carlo", "sarsa_td0"}
+arq_q_target=${ARQ_Q_TARGET:-sarsa_td0}
+arq_q_loss_mode=${ARQ_Q_LOSS_MODE:-absolute} # train Q or Q-V
+arq_advantage_mode=${ARQ_ADVANTAGE_MODE:-gae} #{"gae", "qv", "gae_qv_mix"}
+arq_q_advantage_mix_coef=${ARQ_Q_ADVANTAGE_MIX_COEF:-0.0}
+arq_q_lambda=${ARQ_Q_LAMBDA:-null}
+
+# nohup bash examples/arqppo_trainer/run_alfworld_7b.sh > ./log/ALF_SAPO_7b_ap1_gamlam9595_wSARSA_wNorm_s3_wClip.log 2>&1 &
 arq_positive_token=${ARQ_POSITIVE_TOKEN:-'<|vision_start|>'}
 arq_negative_token=${ARQ_NEGATIVE_TOKEN:-'<|vision_end|>'}
 
@@ -35,8 +47,11 @@ python3 -m verl.trainer.main_ppo \
     algorithm.arq.q_cliprange=0.2 \
     algorithm.arq.value_loss_coef=0.1 \
     algorithm.arq.q_loss_coef=0.1 \
-    algorithm.arq.advantage_mode=gae \
-    algorithm.arq.q_target=td0 \
+    algorithm.arq.advantage_mode="$arq_advantage_mode" \
+    algorithm.arq.q_advantage_mix_coef="$arq_q_advantage_mix_coef" \
+    algorithm.arq.q_target="$arq_q_target" \
+    algorithm.arq.q_lambda="$arq_q_lambda" \
+    algorithm.arq.q_loss_mode="$arq_q_loss_mode" \
     algorithm.arq.normalize_turn_advantage=True \
     algorithm.arq.exclude_value_tokens_from_policy=True \
     data.train_files="$HOME/data/verl-agent/text/train.parquet" \
@@ -67,18 +82,18 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=False \
     actor_rollout_ref.actor.use_invalid_action_penalty=True \
     actor_rollout_ref.actor.invalid_action_penalty_coef=1.0 \
-    actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=16 \
+    actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=32 \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
     actor_rollout_ref.rollout.name="$ENGINE" \
     actor_rollout_ref.rollout.n=1 \
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.45\
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.45 \
     actor_rollout_ref.rollout.enable_chunked_prefill=False \
     actor_rollout_ref.rollout.enforce_eager=False \
     actor_rollout_ref.rollout.free_cache_engine=False \
     actor_rollout_ref.rollout.val_kwargs.temperature=0.4 \
     actor_rollout_ref.rollout.val_kwargs.do_sample=True \
-    actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=16 \
-    actor_rollout_ref.ref.fsdp_config.param_offload=True \
+    actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=32 \
+    actor_rollout_ref.ref.fsdp_config.param_offload=False \
     actor_rollout_ref.novelty_module.enable=False \
     env.env_name=alfworld/AlfredTWEnv \
     env.seed=3 \
@@ -88,11 +103,11 @@ python3 -m verl.trainer.main_ppo \
     trainer.critic_warmup=0 \
     trainer.logger="['console','wandb']" \
     trainer.project_name=verl_agent \
-    trainer.experiment_name=arqppo_gae_qwen2.5_7b_ARQPPO_Gae_QV_Ap1_gamlam9595_init0_t1_fixPros_wQ \
+    trainer.experiment_name=qwen2.5_7b_SAPO_Gae_QV_Ap1_gamlam9595_init0_t1_wSARSA_wNorm_OPT_s3_wClip \
     trainer.n_gpus_per_node=2 \
     trainer.nnodes=1 \
     trainer.save_freq=150 \
-    trainer.test_freq=-1 \
+    trainer.test_freq=5 \
     trainer.total_epochs=150 \
-    trainer.val_before_train=False \
+    trainer.val_before_train=True \
     "$@"
