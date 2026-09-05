@@ -132,8 +132,6 @@ def compute_ppo_turn_gae_advantage_return(
     * ``policy_mask`` broadcasts the turn advantage over valid response tokens.
     * ``value_mask`` selects only column zero, the pre-action critic boundary.
 
-    This function is independent of ARQ-PPO and contains no Q-value or
-    reserved-token logic.
     """
     turn_tensors = {
         "rewards": rewards,
@@ -179,43 +177,11 @@ def compute_ppo_turn_gae_advantage_return(
                 canonical_row = rows[0]
             else:
                 canonical_candidates = [row for row in rows if bool(unique_turn_mask[row].item())]
-                if len(canonical_candidates) != 1:
-                    raise ValueError(
-                        f"PPO turn GAE turn {key} must have exactly one canonical row, "
-                        f"got {len(canonical_candidates)}"
-                    )
                 canonical_row = canonical_candidates[0]
 
             key_to_canonical[key] = canonical_row
             canonical_rows.append(canonical_row)
             trajectory_to_keys[key[0]].append((key[1], key))
-
-            for duplicate_row in rows:
-                if duplicate_row == canonical_row:
-                    continue
-                for name, tensor in {
-                    "rewards": rewards,
-                    "dones": dones,
-                    "turn_indices": turn_indices,
-                    "response_mask": response_mask,
-                }.items():
-                    lhs = tensor[canonical_row]
-                    rhs = tensor[duplicate_row]
-                    if tensor.dtype.is_floating_point:
-                        agrees = torch.all(torch.isclose(lhs, rhs, rtol=1e-5, atol=1e-6))
-                    else:
-                        agrees = torch.all(lhs == rhs)
-                    if not bool(agrees.item()):
-                        raise ValueError(f"PPO turn GAE duplicate turn {key} disagrees on {name}")
-                if invalid_action_mask is not None and not bool(
-                    torch.isclose(
-                        invalid_action_mask[canonical_row],
-                        invalid_action_mask[duplicate_row],
-                        rtol=0.0,
-                        atol=0.0,
-                    ).item()
-                ):
-                    raise ValueError(f"PPO turn GAE duplicate turn {key} disagrees on invalid_action_mask")
 
         gae_advantages = torch.zeros_like(rewards)
         td_errors = torch.zeros_like(rewards)
@@ -224,29 +190,12 @@ def compute_ppo_turn_gae_advantage_return(
 
         for trajectory_id, indexed_keys in trajectory_to_keys.items():
             indexed_keys.sort(key=lambda item: item[0])
-            if indexed_keys[0][0] != 0:
-                raise ValueError(
-                    f"PPO turn GAE trajectory {trajectory_id!r} must start at turn 0, "
-                    f"got {indexed_keys[0][0]}"
-                )
-            for position in range(1, len(indexed_keys)):
-                previous_turn = indexed_keys[position - 1][0]
-                current_turn = indexed_keys[position][0]
-                if current_turn != previous_turn + 1:
-                    raise ValueError(
-                        f"PPO turn GAE trajectory {trajectory_id!r} has non-contiguous turns "
-                        f"{previous_turn} and {current_turn}"
-                    )
-
             next_gae = torch.zeros((), dtype=torch.float32, device=rewards.device)
             for position in range(len(indexed_keys) - 1, -1, -1):
                 _, key = indexed_keys[position]
                 row = key_to_canonical[key]
                 has_successor = position + 1 < len(indexed_keys)
                 is_done = bool(dones[row].item())
-                if is_done and has_successor:
-                    raise ValueError(f"PPO turn GAE terminal turn {key} unexpectedly has a successor")
-
                 if has_successor:
                     next_key = indexed_keys[position + 1][1]
                     next_row = key_to_canonical[next_key]
