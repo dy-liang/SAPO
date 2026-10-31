@@ -292,7 +292,7 @@ def value_outputs_from_logits(
         raise ValueError(f"reward_max must be positive, got {reward_max}")
     logit_gaps = (positive_logits - negative_logits) / value_temperature
     #scores = 2.0 * torch.sigmoid(logit_gaps) - 1
-    clipped = torch.clamp(logit_gaps, -1, 1)
-    scores = logit_gaps + (clipped - logit_gaps).detach() # hard-clip STE
+    #clipped = torch.clamp(logit_gaps, -1, 1)
+    #scores = logit_gaps + (clipped - logit_gaps).detach() # hard-clip STE
     #scores = logit_gaps / (1.0 + logit_gaps.abs()) #softsign
-    return {"probs": scores, "values": scores * reward_max, "logit_gaps": logit_gaps}
+    return {"probs": logit_gaps, "values": logit_gaps * reward_max, "logit_gaps": logit_gaps}
