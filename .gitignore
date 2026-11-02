@@ -9,6 +9,7 @@
 **/playground
 **/wandb
 test_*
+!tests/agent_system/test_swebench.py
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

@@ -416,6 +416,35 @@ class TrajectoryCollector:
             # Break if all environments are done
             if is_done.all():
                 break
+
+        # SWE-style tasks are evaluated from the final filesystem state.  If an
+        # episode reaches the rollout limit without an explicit submit action,
+        # finalize it here and attach the terminal reward to its last real turn.
+        if not is_done.all() and hasattr(envs, "finalize"):
+            unfinished = np.logical_not(is_done)
+            finalized = envs.finalize(active_masks=unfinished)
+            if finalized is not None:
+                final_rewards, final_dones, final_infos = finalized
+                final_rewards = np.asarray(final_rewards, dtype=np.float32)
+                final_dones = np.asarray(final_dones, dtype=bool)
+                if len(final_rewards) != batch_size or len(final_infos) != batch_size:
+                    raise ValueError("env.finalize must return one result per environment")
+
+                episode_rewards[unfinished] += final_rewards[unfinished]
+                for i in np.flatnonzero(unfinished):
+                    if not total_batch_list[i]:
+                        continue
+                    last_data = total_batch_list[i][-1]
+                    last_env_reward = last_data["env_reward"]
+                    last_data["env_reward"] = last_env_reward + last_env_reward.new_tensor(
+                        float(final_rewards[i])
+                    )
+                    last_data["done"] = last_data["done"].new_tensor(
+                        bool(final_dones[i]), dtype=torch.bool
+                    )
+                    last_data["rewards"] = float(last_data["rewards"]) + float(final_rewards[i])
+                    total_infos[i][-1].update(final_infos[i])
+                is_done = np.logical_or(is_done, final_dones)
         
         success: Dict[str, np.ndarray] = envs.success_evaluator(
                     total_infos=total_infos,

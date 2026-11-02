@@ -516,6 +516,104 @@ class WebshopEnvironmentManager(EnvironmentManagerBase):
                 success['webshop_task_score (not success_rate)'].append(score_value)
                 return
 
+
+class SWEBenchEnvironmentManager(EnvironmentManagerBase):
+    """Adapter between SAPO's text rollout loop and Docker SWE-bench workers."""
+
+    def __init__(self, envs, projection_f, config):
+        self.memory = SimpleMemory()
+        self.tasks = []
+        self.pre_text_obs = []
+        super().__init__(envs, projection_f, config)
+
+    def reset(self, kwargs) -> Dict[str, Any]:
+        if kwargs is None:
+            raise ValueError("SWE-bench requires env_kwargs in every dataset row")
+        samples = list(kwargs)
+        text_obs, infos = self.envs.reset(kwargs=samples)
+        self.tasks = [str(sample["problem_statement"]) for sample in samples]
+        self.pre_text_obs = text_obs
+        self.memory.reset(batch_size=len(text_obs))
+        observations = {
+            "text": self.build_text_obs(text_obs, init=True),
+            "image": None,
+            "anchor": [info.get("instance_id") for info in infos],
+        }
+        return observations, infos
+
+    def step(self, text_actions: List[str]):
+        actions, valids = self.projection_f(text_actions)
+        next_obs, rewards, dones, infos = self.envs.step(actions)
+        self.memory.store({"text_obs": self.pre_text_obs, "action": actions})
+        self.pre_text_obs = next_obs
+
+        for index, info in enumerate(infos):
+            info["is_action_valid"] = to_numpy(valids[index])
+
+        observations = {
+            "text": self.build_text_obs(next_obs),
+            "image": None,
+            "anchor": [info.get("instance_id") for info in infos],
+        }
+        return observations, to_numpy(rewards), to_numpy(dones), infos
+
+    def finalize(self, active_masks):
+        """Evaluate unfinished repositories and return terminal rewards."""
+        rewards, dones, infos = self.envs.finalize(list(active_masks))
+        for info in infos:
+            info.setdefault("is_action_valid", True)
+        return to_numpy(rewards), to_numpy(dones), infos
+
+    def build_text_obs(self, text_obs: List[str], init: bool = False) -> List[str]:
+        postprocessed = []
+        history_limit = int(self.config.env.swebench.history_char_limit)
+        observation_limit = int(self.config.env.swebench.output_limit)
+
+        for index, current_obs in enumerate(text_obs):
+            current_obs = str(current_obs)
+            if observation_limit > 0 and len(current_obs) > observation_limit:
+                current_obs = current_obs[-observation_limit:]
+
+            if init or self.config.env.history_length <= 0:
+                prompt = SWEBENCH_TEMPLATE_NO_HIS.format(
+                    task_description=self.tasks[index],
+                    current_observation=current_obs,
+                )
+            else:
+                recent = self.memory[index][-self.config.env.history_length :]
+                start_step = len(self.memory[index]) - len(recent) + 1
+                history_parts = []
+                for offset, record in enumerate(recent):
+                    previous_obs = str(record["text_obs"])
+                    if observation_limit > 0 and len(previous_obs) > observation_limit:
+                        previous_obs = previous_obs[-observation_limit:]
+                    history_parts.append(
+                        f"Step {start_step + offset}\n"
+                        f"Action: {record['action']}\n"
+                        f"Observation: {previous_obs}"
+                    )
+                history = "\n\n".join(history_parts)
+                if history_limit > 0 and len(history) > history_limit:
+                    history = "... <older history clipped> ...\n" + history[-history_limit:]
+                prompt = SWEBENCH_TEMPLATE.format(
+                    task_description=self.tasks[index],
+                    step_count=len(self.memory[index]),
+                    action_history=history,
+                    current_step=len(self.memory[index]) + 1,
+                    current_observation=current_obs,
+                )
+            postprocessed.append(prompt)
+
+        return postprocessed
+
+    def _process_batch(self, batch_idx, total_batch_list, total_infos, success):
+        for step in reversed(range(len(total_batch_list[batch_idx]))):
+            if total_batch_list[batch_idx][step]["active_masks"]:
+                info = total_infos[batch_idx][step]
+                success["success_rate"].append(float(info.get("resolved", info.get("won", False))))
+                success["eval_completed_rate"].append(float(info.get("eval_completed", False)))
+                return
+
 class AppWorldEnvironmentManager(EnvironmentManagerBase):
     def __init__(self, envs, projection_f, config):
         self.memory = SimpleMemory()
@@ -661,6 +759,29 @@ def make_envs(config):
         envs = SokobanEnvironmentManager(_envs, projection_f, config)
         val_envs = SokobanEnvironmentManager(_val_envs, projection_f, config)
         return envs, val_envs
+    elif "swebench" in config.env.env_name.lower() or "swe_bench" in config.env.env_name.lower():
+        from agent_system.environments.env_package.swebench import build_swebench_envs, swebench_projection
+
+        swebench_config = OmegaConf.to_container(config.env.swebench, resolve=True)
+        _envs = build_swebench_envs(
+            env_num=config.data.train_batch_size,
+            group_n=group_n,
+            resources_per_worker=resources_per_worker,
+            env_config=swebench_config,
+            is_train=True,
+        )
+        _val_envs = build_swebench_envs(
+            env_num=config.data.val_batch_size,
+            group_n=1,
+            resources_per_worker=resources_per_worker,
+            env_config=swebench_config,
+            is_train=False,
+        )
+        projection_f = partial(swebench_projection)
+        return (
+            SWEBenchEnvironmentManager(_envs, projection_f, config),
+            SWEBenchEnvironmentManager(_val_envs, projection_f, config),
+        )
     elif "webshop" in config.env.env_name.lower():
         from agent_system.environments.env_package.webshop import build_webshop_envs, webshop_projection
         if config.env.webshop.use_small:

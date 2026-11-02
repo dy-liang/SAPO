@@ -352,3 +352,18 @@ env:
   webshop:
     use_small: True
     human_goals: False
+  swebench:
+    # Canonical image name is
+    #   <image_prefix>.<instance_id with __ replaced by _1776_>
+    image_prefix: swebench/sweb.eval.x86_64
+    pull_images: True
+    network_disabled: True
+    sanitize_git_history: True
+    container_user: root
+    cap_add_sys_admin: False
+    setup_timeout: 300
+    command_timeout: 120
+    eval_timeout: 600
+    output_limit: 12000
+    history_char_limit: 24000
+    reward_success: 10.0

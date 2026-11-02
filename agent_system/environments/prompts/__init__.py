@@ -19,3 +19,4 @@ from .sokoban import *
 from .gym_cards import *
 from .appworld import *
 from .search import *
+from .swebench import *
