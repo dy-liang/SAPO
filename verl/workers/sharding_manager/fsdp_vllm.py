@@ -176,6 +176,13 @@ class FSDPVLLMShardingManager(BaseShardingManager):
             params = __collect_lora_params()
         else:
             params = self.module.state_dict()
+            # SharedHead-PPO's scalar value head is training-only.  vLLM owns
+            # only the causal-LM parameters and must not receive this extra key.
+            params = type(params)(
+                (key, value)
+                for key, value in params.items()
+                if "value_head" not in key.split(".")
+            )
         log_gpu_memory_usage("After state_dict() in sharding manager memory", logger=logger)
 
         # Copy, not share memory

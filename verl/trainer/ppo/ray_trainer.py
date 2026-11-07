@@ -96,6 +96,7 @@ class AdvantageEstimator(str, Enum):
     GiGPO = 'gigpo'
     ARQ_PPO = "arq_ppo"
     PPO_TURN_GAE = "ppo_turn_gae"
+    SHARED_HEAD_PPO = "shared_head_ppo"
 
 
 @dataclass
@@ -401,8 +402,16 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
         data.batch["grpo_advantages"] = advantages
         data.batch["step_len_advantages"] = advantages # do not use
         data.batch["token_len_advantages"] = advantages # do not use
-    elif adv_estimator == AdvantageEstimator.PPO_TURN_GAE:
+    elif adv_estimator in (
+        AdvantageEstimator.PPO_TURN_GAE,
+        AdvantageEstimator.SHARED_HEAD_PPO,
+    ):
         ppo_turn_config = kwargs["ppo_turn_gae_config"]
+        if adv_estimator == AdvantageEstimator.SHARED_HEAD_PPO:
+            ppo_turn_config = kwargs["shared_head_ppo_config"]
+            old_values = data.batch["old_shared_values"]
+        else:
+            old_values = data.batch["values"][:, 0]
         action_valid = np.asarray(data.non_tensor_batch["is_action_valid"], dtype=bool)
         invalid_action_mask = torch.as_tensor(
             np.logical_not(action_valid),
@@ -415,7 +424,7 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
             # DataParallelPPOCritic returns values for positions
             # [-response_length - 1 : -1]. Column zero is therefore the last
             # prompt token, i.e. the pre-action V(s_t) boundary used by ARQ.
-            old_values=data.batch["values"][:, 0],
+            old_values=old_values,
             response_mask=data.batch["response_mask"],
             trajectory_ids=data.non_tensor_batch["traj_uid"],
             turn_indices=data.batch["turn_index"],
@@ -441,6 +450,15 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
         data.batch["ppo_turn_policy_mask"] = ppo_turn_result["policy_mask"]
         data.batch["ppo_turn_value_mask"] = ppo_turn_result["value_mask"]
         data.batch["ppo_turn_truncated"] = ppo_turn_result["truncated"]
+        if adv_estimator == AdvantageEstimator.SHARED_HEAD_PPO:
+            reward_max = float(ppo_turn_config.reward_max)
+            target_units = ppo_turn_result["value_targets"] / reward_max
+            data.batch["shared_value_target_clipped"] = (
+                (target_units < -1.0) | (target_units > 1.0)
+            )
+            data.batch["shared_value_target_units"] = torch.clamp(
+                target_units, min=-1.0, max=1.0
+            )
     elif adv_estimator == AdvantageEstimator.ARQ_PPO:
         arq_config = kwargs["arq_config"]
         action_valid = np.asarray(data.non_tensor_batch["is_action_valid"], dtype=bool)
@@ -562,6 +580,11 @@ class RayPPOTrainer:
             # node into that subtree without changing any normal actor fields.
             with open_dict(self.config.actor_rollout_ref):
                 self.config.actor_rollout_ref.arq = deepcopy(self.config.algorithm.arq)
+        elif self.config.algorithm.adv_estimator == AdvantageEstimator.SHARED_HEAD_PPO:
+            with open_dict(self.config.actor_rollout_ref):
+                self.config.actor_rollout_ref.shared_value = deepcopy(
+                    self.config.algorithm.shared_head_ppo
+                )
         self.reward_fn = reward_fn
         self.val_reward_fn = val_reward_fn
         self.envs = envs
@@ -606,6 +629,7 @@ class RayPPOTrainer:
             AdvantageEstimator.GiGPO,
             AdvantageEstimator.planpo,
             AdvantageEstimator.ARQ_PPO,
+            AdvantageEstimator.SHARED_HEAD_PPO,
         ]:
             self.use_critic = False
         else:
@@ -772,6 +796,28 @@ class RayPPOTrainer:
                 arq.negative_token is not None or arq.negative_token_id is not None
             ), "Configure an ARQ negative token or token ID"
             assert arq.exclude_value_tokens_from_policy, "ARQ value tokens must be excluded from policy support"
+
+        if config.algorithm.adv_estimator == AdvantageEstimator.SHARED_HEAD_PPO:
+            shared_value = config.algorithm.shared_head_ppo
+            assert shared_value.enable, "algorithm.shared_head_ppo.enable must be true"
+            assert config.actor_rollout_ref.actor.strategy in ["fsdp", "fsdp2"]
+            assert config.actor_rollout_ref.rollout.name == "vllm"
+            assert config.actor_rollout_ref.rollout.mode == "sync"
+            assert config.actor_rollout_ref.rollout.n == 1
+            assert config.env.rollout.n == 1
+            assert config.actor_rollout_ref.actor.ppo_epochs == 1
+            assert config.actor_rollout_ref.actor.ulysses_sequence_parallel_size == 1
+            assert not config.actor_rollout_ref.actor.use_dynamic_bsz
+            assert not config.actor_rollout_ref.model.use_fused_kernels
+            assert config.actor_rollout_ref.model.get("lora_rank", 0) == 0
+            assert not config.algorithm.use_kl_in_reward
+            assert shared_value.reward_max > 0
+            assert shared_value.value_cliprange >= 0
+            assert shared_value.value_loss_coef >= 0
+            assert 0 <= config.algorithm.gamma <= 1
+            assert 0 <= config.algorithm.lam <= 1
+            assert config.actor_rollout_ref.actor.loss_agg_mode == "token-mean"
+            assert not config.algorithm.filter_groups.enable
 
         if config.algorithm.adv_estimator == AdvantageEstimator.PPO_TURN_GAE:
             assert config.actor_rollout_ref.actor.strategy in ["fsdp", "fsdp2"], (
@@ -1387,7 +1433,10 @@ class RayPPOTrainer:
                             device=batch.batch["turn_index"].device,
                         )
 
-                    if self.config.algorithm.adv_estimator == AdvantageEstimator.PPO_TURN_GAE:
+                    if self.config.algorithm.adv_estimator in (
+                        AdvantageEstimator.PPO_TURN_GAE,
+                        AdvantageEstimator.SHARED_HEAD_PPO,
+                    ):
                         # adjust_batch appends shape-only copies. Mark one PPO
                         # canonical row per environment transition before
                         # balance_batch reorders the full DataProto.
@@ -1407,7 +1456,10 @@ class RayPPOTrainer:
                         )
 
                     batch.batch["response_mask"] = compute_response_mask(batch)
-                    if self.config.algorithm.adv_estimator == AdvantageEstimator.PPO_TURN_GAE:
+                    if self.config.algorithm.adv_estimator in (
+                        AdvantageEstimator.PPO_TURN_GAE,
+                        AdvantageEstimator.SHARED_HEAD_PPO,
+                    ):
                         unique_turn_mask = batch.batch["ppo_turn_unique_mask"]
                         response_mask = batch.batch["response_mask"].bool()
                         batch.batch["ppo_turn_policy_mask"] = (
@@ -1536,7 +1588,10 @@ class RayPPOTrainer:
                                     batch.non_tensor_batch['is_action_valid'].astype(np.float32)
                                 ).item()
                                 metrics.update({'episode/valid_action_ratio': valid_action_ratio})
-                            elif self.config.algorithm.adv_estimator == AdvantageEstimator.PPO_TURN_GAE:
+                            elif self.config.algorithm.adv_estimator in (
+                                AdvantageEstimator.PPO_TURN_GAE,
+                                AdvantageEstimator.SHARED_HEAD_PPO,
+                            ):
                                 # PPO turn GAE likewise keeps invalid-action
                                 # shaping out of rewards and critic targets; it
                                 # is applied to the policy advantage only.
@@ -1583,6 +1638,7 @@ class RayPPOTrainer:
                             epoch=epoch,
                             arq_config=self.config.algorithm.arq,
                             ppo_turn_gae_config=self.config.algorithm.get("ppo_turn_gae", {}),
+                            shared_head_ppo_config=self.config.algorithm.get("shared_head_ppo", {}),
                             global_step=self.global_steps,
                             total_training_steps=self.total_training_steps,
                             invalid_action_penalty_coef=(

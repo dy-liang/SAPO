@@ -191,6 +191,10 @@ class ActorRolloutRefWorker(Worker):
         from verl.utils.torch_dtypes import PrecisionType
 
         assert role in ["actor", "ref"]
+        shared_value_config = self.config.get("shared_value", {})
+        shared_value_enabled = (
+            role == "actor" and shared_value_config.get("enable", False)
+        )
 
         log_gpu_memory_usage(f"Before init {role} from HF AutoModel", logger=logger)
         local_path = model_path
@@ -279,6 +283,18 @@ class ActorRolloutRefWorker(Worker):
                     'bias': "none"
                 }
                 actor_module = get_peft_model(actor_module, LoraConfig(**lora_config))
+            if shared_value_enabled:
+                hidden_size = getattr(actor_model_config, "hidden_size", None)
+                if hidden_size is None and hasattr(actor_model_config, "text_config"):
+                    hidden_size = actor_model_config.text_config.hidden_size
+                if hidden_size is None:
+                    raise ValueError("SharedHead-PPO requires a model hidden_size")
+                value_head = torch.nn.Linear(int(hidden_size), 1, bias=True).to(
+                    dtype=torch_dtype
+                )
+                torch.nn.init.zeros_(value_head.weight)
+                torch.nn.init.zeros_(value_head.bias)
+                actor_module.add_module("value_head", value_head)
         torch.distributed.barrier()
 
         if self.rank == 0:
@@ -537,6 +553,17 @@ class ActorRolloutRefWorker(Worker):
                 f"negative={resolved['negative_token']!r}/{resolved['negative_token_id']}"
             )
 
+    def _configure_shared_value(self):
+        """Pass the isolated shared-value config only to the trainable actor."""
+        shared_value_config = self.config.get("shared_value", None)
+        if shared_value_config is None or not shared_value_config.get("enable", False):
+            return
+        resolved_config = OmegaConf.create(
+            OmegaConf.to_container(shared_value_config, resolve=True)
+        )
+        with open_dict(self.config.actor):
+            self.config.actor.shared_value = resolved_config
+
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def init_model(self):
         from verl.workers.actor import DataParallelPPOActor
@@ -545,6 +572,8 @@ class ActorRolloutRefWorker(Worker):
         import_external_libs(self.config.model.get("external_lib", None))
 
         from omegaconf import OmegaConf
+
+        self._configure_shared_value()
 
         override_model_config = OmegaConf.to_container(self.config.model.get("override_config", OmegaConf.create()))
 
@@ -735,27 +764,38 @@ class ActorRolloutRefWorker(Worker):
             data = self.ulysses_sharding_manager.preprocess_data(data)
             with adapter_ctx:
                 calculate_arq = self.config.get("arq", {}).get("enable", False)
+                calculate_shared_value = self.config.get("shared_value", {}).get(
+                    "enable", False
+                )
                 log_prob_outputs = self.actor.compute_log_prob(
                         data=data,
                         calculate_entropy=True,
                         calculate_nov=False,
                         calculate_arq=calculate_arq,
+                        calculate_shared_value=calculate_shared_value,
                     )
-                if calculate_arq:
-                    output, entropys, _, arq_outputs = log_prob_outputs
+                if calculate_arq or calculate_shared_value:
+                    output, entropys, _, auxiliary_outputs = log_prob_outputs
                 else:
                     output, entropys, _ = log_prob_outputs
-                    arq_outputs = None
+                    auxiliary_outputs = None
             output_tensors = {"old_log_probs": output, "entropys": entropys}
             if calculate_arq:
                 output_tensors.update(
                     {
-                        "old_v_probs": arq_outputs["v_probs"],
-                        "old_q_probs": arq_outputs["q_probs"],
-                        "old_v_values": arq_outputs["v_values"],
-                        "old_q_values": arq_outputs["q_values"],
-                        "old_v_logit_gaps": arq_outputs["v_logit_gaps"],
-                        "old_q_logit_gaps": arq_outputs["q_logit_gaps"],
+                        "old_v_probs": auxiliary_outputs["v_probs"],
+                        "old_q_probs": auxiliary_outputs["q_probs"],
+                        "old_v_values": auxiliary_outputs["v_values"],
+                        "old_q_values": auxiliary_outputs["q_values"],
+                        "old_v_logit_gaps": auxiliary_outputs["v_logit_gaps"],
+                        "old_q_logit_gaps": auxiliary_outputs["q_logit_gaps"],
+                    }
+                )
+            if calculate_shared_value:
+                output_tensors.update(
+                    {
+                        "old_shared_value_units": auxiliary_outputs["shared_value_units"],
+                        "old_shared_values": auxiliary_outputs["shared_values"],
                     }
                 )
             output = DataProto.from_dict(

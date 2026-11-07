@@ -124,17 +124,21 @@ class DataParallelPPOActor(BasePPOActor):
 
         self.arq_config = self.config.get("arq", None)
         self.arq_enabled = self.arq_config is not None and self.arq_config.get("enable", False)
+        self.shared_value_config = self.config.get("shared_value", None)
+        self.shared_value_enabled = (
+            self.shared_value_config is not None
+            and self.shared_value_config.get("enable", False)
+        )
+        if self.arq_enabled and self.shared_value_enabled:
+            raise ValueError("ARQ and SharedHead-PPO value branches are mutually exclusive")
         self.arq_token_ids = ()
         self.arq_lm_head = None
-        if self.arq_enabled:
-            self.arq_token_ids = (
-                int(self.arq_config.positive_token_id),
-                int(self.arq_config.negative_token_id),
-            )
+        self.shared_value_head = None
+        if self.arq_enabled or self.shared_value_enabled:
             if self.use_fused_kernels:
-                raise ValueError("ARQ-PPO v1 does not support fused actor kernels")
+                raise ValueError("Auxiliary value branches do not support fused actor kernels")
             if self.use_ulysses_sp:
-                raise ValueError("ARQ-PPO v1 does not support Ulysses sequence parallelism")
+                raise ValueError("Auxiliary value branches do not support Ulysses sequence parallelism")
             actor_root = (
                 self.actor_module._fsdp_wrapped_module
                 if isinstance(self.actor_module, FSDP)
@@ -142,13 +146,22 @@ class DataParallelPPOActor(BasePPOActor):
             )
             get_output_embeddings = getattr(actor_root, "get_output_embeddings", None)
             if get_output_embeddings is None:
-                raise ValueError("ARQ requires a causal LM exposing get_output_embeddings()")
+                raise ValueError("Value branches require a causal LM exposing get_output_embeddings()")
             self.arq_lm_head = get_output_embeddings()
             if isinstance(self.arq_lm_head, FSDP):
                 self.arq_lm_head = self.arq_lm_head._fsdp_wrapped_module
-            lm_head_weight = getattr(self.arq_lm_head, "weight", None)
-            if lm_head_weight is None:
-                raise ValueError("ARQ requires a linear LM head exposing weight")
+            if self.arq_enabled:
+                self.arq_token_ids = (
+                    int(self.arq_config.positive_token_id),
+                    int(self.arq_config.negative_token_id),
+                )
+                lm_head_weight = getattr(self.arq_lm_head, "weight", None)
+                if lm_head_weight is None:
+                    raise ValueError("ARQ requires a linear LM head exposing weight")
+            if self.shared_value_enabled:
+                self.shared_value_head = getattr(actor_root, "value_head", None)
+                if self.shared_value_head is None:
+                    raise ValueError("SharedHead-PPO actor is missing value_head")
 
     def _get_arq_boundary_positions(self, attention_mask, response_length, unpad_indices=None):
         """Return padded or compact [B, V/Q] LM-head input positions."""
@@ -189,12 +202,28 @@ class DataParallelPPOActor(BasePPOActor):
             "q_logit_gaps": q_output["logit_gaps"],
         }
 
+    @staticmethod
+    def _select_boundary_hidden(hidden_states, boundary_positions):
+        """Gather one hidden state per row from padded or remove-padding output."""
+        if boundary_positions.ndim != 1:
+            raise ValueError("Shared value boundary positions must have shape [batch]")
+        if hidden_states.ndim == 3 and hidden_states.shape[0] == boundary_positions.shape[0]:
+            batch_indices = torch.arange(hidden_states.shape[0], device=hidden_states.device)
+            return hidden_states[batch_indices, boundary_positions]
+        if hidden_states.ndim == 3:
+            if hidden_states.shape[0] != 1:
+                raise ValueError("Remove-padding hidden states must have leading dimension 1")
+            hidden_states = hidden_states.squeeze(0)
+        if hidden_states.ndim != 2:
+            raise ValueError("Shared value hidden states must be rank 2 or 3")
+        return hidden_states[boundary_positions]
+
     def _forward_actor_with_arq(self, forward_kwargs, boundary_positions=None):
         """Run the actor and project V/Q inside the LM-head FSDP context."""
         if boundary_positions is None:
             return self.actor_module(**forward_kwargs), None
 
-        captured_boundary_logits = []
+        captured_auxiliary_outputs = []
 
         def capture_lm_head_input(module, args, kwargs):
             hidden_states = args[0] if args else kwargs.get("input")
@@ -202,15 +231,29 @@ class DataParallelPPOActor(BasePPOActor):
                 hidden_states = kwargs.get("hidden_states")
             if hidden_states is None:
                 raise RuntimeError("ARQ could not capture the LM-head hidden states")
-            captured_boundary_logits.append(
-                project_arq_boundary_logits(
+            auxiliary_outputs = {}
+            if self.arq_enabled:
+                boundary_logits = project_arq_boundary_logits(
                     hidden_states=hidden_states,
                     boundary_positions=boundary_positions,
                     lm_head_weight=module.weight,
                     lm_head_bias=getattr(module, "bias", None),
                     value_token_ids=self.arq_token_ids,
                 )
-            )
+                auxiliary_outputs.update(self._arq_outputs_from_boundary_logits(boundary_logits))
+            if self.shared_value_enabled:
+                boundary_hidden = self._select_boundary_hidden(
+                    hidden_states, boundary_positions[:, 0]
+                )
+                value_units = self.shared_value_head(boundary_hidden).squeeze(-1)
+                auxiliary_outputs.update(
+                    {
+                        "shared_value_units": value_units,
+                        "shared_values": value_units
+                        * float(self.shared_value_config.reward_max),
+                    }
+                )
+            captured_auxiliary_outputs.append(auxiliary_outputs)
 
         hook_handle = self.arq_lm_head.register_forward_pre_hook(
             capture_lm_head_input, with_kwargs=True
@@ -220,17 +263,28 @@ class DataParallelPPOActor(BasePPOActor):
         finally:
             hook_handle.remove()
 
-        if len(captured_boundary_logits) != 1:
+        if len(captured_auxiliary_outputs) != 1:
             raise RuntimeError(
-                "ARQ expected exactly one LM-head call, got "
-                f"{len(captured_boundary_logits)}"
+                "Value branch expected exactly one LM-head call, got "
+                f"{len(captured_auxiliary_outputs)}"
             )
-        boundary_logits = captured_boundary_logits[0]
+        auxiliary_outputs = captured_auxiliary_outputs[0]
         if hasattr(output, "logits"):
-            boundary_logits = boundary_logits.to(output.logits.dtype)
-        return output, self._arq_outputs_from_boundary_logits(boundary_logits)
+            auxiliary_outputs = {
+                key: value.to(output.logits.dtype)
+                for key, value in auxiliary_outputs.items()
+            }
+        return output, auxiliary_outputs
 
-    def _forward_micro_batch(self, micro_batch, temperature, calculate_entropy=False, calculate_nov=False, calculate_arq=False) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _forward_micro_batch(
+        self,
+        micro_batch,
+        temperature,
+        calculate_entropy=False,
+        calculate_nov=False,
+        calculate_arq=False,
+        calculate_shared_value=False,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Returns:
             entropy: # (bs, response_len)
@@ -305,7 +359,9 @@ class DataParallelPPOActor(BasePPOActor):
                     **extra_args,
                 )
                 arq_boundary_positions = None
-                if self.arq_enabled and calculate_arq:
+                if (self.arq_enabled and calculate_arq) or (
+                    self.shared_value_enabled and calculate_shared_value
+                ):
                     arq_boundary_positions = self._get_arq_boundary_positions(
                         attention_mask=attention_mask,
                         response_length=response_length,
@@ -387,7 +443,9 @@ class DataParallelPPOActor(BasePPOActor):
                     **extra_args,
                 )
                 arq_boundary_positions = None
-                if self.arq_enabled and calculate_arq:
+                if (self.arq_enabled and calculate_arq) or (
+                    self.shared_value_enabled and calculate_shared_value
+                ):
                     arq_boundary_positions = self._get_arq_boundary_positions(
                         attention_mask=attention_mask,
                         response_length=response_length,
@@ -423,7 +481,7 @@ class DataParallelPPOActor(BasePPOActor):
                         if calculate_entropy:
                             entropy = verl_F.entropy_from_logits(response_logits)  # (bsz, response_length)
 
-            if calculate_arq:
+            if calculate_arq or calculate_shared_value:
                 return entropy, log_probs, action_novelty, arq_outputs
             return entropy, log_probs, action_novelty
 
@@ -446,7 +504,14 @@ class DataParallelPPOActor(BasePPOActor):
         return grad_norm
 
     @GPUMemoryLogger(role="dp actor", logger=logger)
-    def compute_log_prob(self, data: DataProto, calculate_entropy=False, calculate_nov=False, calculate_arq=False) -> torch.Tensor:
+    def compute_log_prob(
+        self,
+        data: DataProto,
+        calculate_entropy=False,
+        calculate_nov=False,
+        calculate_arq=False,
+        calculate_shared_value=False,
+    ) -> torch.Tensor:
         """Compute the log probability of the responses given input_ids, attention_mask and position_ids
 
         Args:
@@ -496,6 +561,8 @@ class DataParallelPPOActor(BasePPOActor):
             "q_values": [],
             "v_logit_gaps": [],
             "q_logit_gaps": [],
+            "shared_value_units": [],
+            "shared_values": [],
         }
         for micro_batch in micro_batches:
             if isinstance(micro_batch, DataProto):
@@ -507,8 +574,9 @@ class DataParallelPPOActor(BasePPOActor):
                     calculate_entropy=calculate_entropy,
                     calculate_nov=calculate_nov,
                     calculate_arq=calculate_arq,
+                    calculate_shared_value=calculate_shared_value,
                 )
-                if calculate_arq:
+                if calculate_arq or calculate_shared_value:
                     entropy, log_probs, action_novelty, arq_outputs = forward_outputs
                 else:
                     entropy, log_probs, action_novelty = forward_outputs
@@ -518,7 +586,7 @@ class DataParallelPPOActor(BasePPOActor):
                 entropy_lst.append(entropy)
             if calculate_nov:
                 action_novelty_lst.append(action_novelty)
-            if calculate_arq:
+            if calculate_arq or calculate_shared_value:
                 if arq_outputs is None:
                     raise RuntimeError("ARQ values were requested but the actor did not return them")
                 for key, value in arq_outputs.items():
@@ -532,9 +600,11 @@ class DataParallelPPOActor(BasePPOActor):
         if calculate_nov:
             action_novelties = torch.concat(action_novelty_lst, dim=0)
         concatenated_arq_outputs = None
-        if calculate_arq:
+        if calculate_arq or calculate_shared_value:
             concatenated_arq_outputs = {
-                key: torch.concat(values, dim=0) for key, values in arq_output_lists.items()
+                key: torch.concat(values, dim=0)
+                for key, values in arq_output_lists.items()
+                if values
             }
         if use_dynamic_bsz:
             indices = list(itertools.chain.from_iterable(indices))
@@ -542,7 +612,7 @@ class DataParallelPPOActor(BasePPOActor):
             revert_indices = torch.tensor(get_reverse_idx(indices), dtype=torch.long)
             log_probs = log_probs[revert_indices]
 
-        if calculate_arq:
+        if calculate_arq or calculate_shared_value:
             return log_probs, entropys, action_novelties, concatenated_arq_outputs
         return log_probs, entropys, action_novelties
 
@@ -566,6 +636,14 @@ class DataParallelPPOActor(BasePPOActor):
                     "arq_v_target_probs",
                     "arq_q_target_probs",
                     "arq_unique_turn_mask",
+                ]
+            )
+        if self.shared_value_enabled:
+            select_keys.extend(
+                [
+                    "old_shared_value_units",
+                    "shared_value_target_units",
+                    "ppo_turn_unique_mask",
                 ]
             )
         if multi_turn:
@@ -632,6 +710,11 @@ class DataParallelPPOActor(BasePPOActor):
                         # adjust_batch copies are shape-only padding.  Exclude
                         # them from every ARQ gradient, not only GAE statistics.
                         response_mask = response_mask * arq_sample_mask.unsqueeze(-1)
+                    shared_value_sample_mask = None
+                    if self.shared_value_enabled:
+                        shared_value_sample_mask = data["ppo_turn_unique_mask"].to(
+                            device=response_mask.device, dtype=response_mask.dtype
+                        )
 
                     old_log_prob = data["old_log_probs"]
                     advantages = data["advantages"]
@@ -653,8 +736,9 @@ class DataParallelPPOActor(BasePPOActor):
                             calculate_entropy=calculate_entropy,
                             calculate_nov=False,
                             calculate_arq=self.arq_enabled,
+                            calculate_shared_value=self.shared_value_enabled,
                         )
-                    if self.arq_enabled:
+                    if self.arq_enabled or self.shared_value_enabled:
                         entropy, log_prob, _, arq_outputs = forward_outputs
                     else:
                         entropy, log_prob, _ = forward_outputs
@@ -761,6 +845,36 @@ class DataParallelPPOActor(BasePPOActor):
                                 ).detach().mean().item(),
                                 "arq/v_logit_gap_mean": arq_outputs["v_logit_gaps"].detach().mean().item(),
                                 "arq/q_logit_gap_mean": arq_outputs["q_logit_gaps"].detach().mean().item(),
+                            },
+                        )
+                    elif self.shared_value_enabled:
+                        if arq_outputs is None:
+                            raise RuntimeError("SharedHead-PPO requires current value outputs")
+                        value_loss, value_clipfrac = compute_arq_value_loss(
+                            current_probs=arq_outputs["shared_value_units"],
+                            old_probs=data["old_shared_value_units"],
+                            target_probs=data["shared_value_target_units"],
+                            cliprange=float(self.shared_value_config.value_cliprange),
+                            sample_mask=shared_value_sample_mask,
+                        )
+                        policy_loss = (
+                            policy_loss
+                            + float(self.shared_value_config.value_loss_coef) * value_loss
+                        )
+                        append_to_dict(
+                            metrics,
+                            {
+                                "shared_value/value_loss": value_loss.detach().item(),
+                                "shared_value/value_clipfrac": value_clipfrac.detach().item(),
+                                "shared_value/current_units_mean": arq_outputs[
+                                    "shared_value_units"
+                                ].detach().mean().item(),
+                                "shared_value/current_value_mean": arq_outputs[
+                                    "shared_values"
+                                ].detach().mean().item(),
+                                "shared_value/target_units_mean": data[
+                                    "shared_value_target_units"
+                                ].detach().mean().item(),
                             },
                         )
 

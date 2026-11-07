@@ -71,6 +71,13 @@ actor_rollout_ref:
     ulysses_sequence_parallel_size: 1 # sp size
     policy_loss:
       loss_mode: "vanilla"
+    # Conventional PPO value head sharing the causal-LM backbone.  The head
+    # predicts value units; multiply by reward_max before turn-level GAE.
+    shared_value:
+      enable: False
+      reward_max: 10.0
+      value_cliprange: 0.2
+      value_loss_coef: 0.1
     checkpoint:
       contents: ['model', 'optimizer', 'extra']  # with 'hf_model' you can save whole model as hf format, now only use sharded model checkpoint to save space
     optim:
@@ -262,6 +269,13 @@ algorithm:
     similarity_thresh: 0.95 # similarity threshold for GiGPO (0.0, 1.0)
 
   ppo_turn_gae:
+    normalize_turn_advantage: True
+
+  shared_head_ppo:
+    enable: False
+    reward_max: 10.0
+    value_cliprange: 0.2
+    value_loss_coef: 0.1
     normalize_turn_advantage: True
 
   arq:
