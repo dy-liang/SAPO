@@ -416,7 +416,7 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
         invalid_action_mask = torch.as_tensor(
             np.logical_not(action_valid),
             dtype=torch.float32,
-            device=data.batch["values"].device,
+            device=old_values.device,
         )
         ppo_turn_result = core_algos.compute_ppo_turn_gae_advantage_return(
             rewards=data.batch["env_reward"],
@@ -451,14 +451,18 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
         data.batch["ppo_turn_value_mask"] = ppo_turn_result["value_mask"]
         data.batch["ppo_turn_truncated"] = ppo_turn_result["truncated"]
         if adv_estimator == AdvantageEstimator.SHARED_HEAD_PPO:
-            reward_max = float(ppo_turn_config.reward_max)
-            target_units = ppo_turn_result["value_targets"] / reward_max
-            data.batch["shared_value_target_clipped"] = (
-                (target_units < -1.0) | (target_units > 1.0)
-            )
-            data.batch["shared_value_target_units"] = torch.clamp(
-                target_units, min=-1.0, max=1.0
-            )
+            value_targets = ppo_turn_result["value_targets"]
+            if bool(ppo_turn_config.get("scale_value_target", False)):
+                scaled_targets = value_targets / float(ppo_turn_config.reward_max)
+                data.batch["shared_value_target_clipped"] = (
+                    (scaled_targets < -1.0) | (scaled_targets > 1.0)
+                )
+                value_targets = torch.clamp(scaled_targets, min=-1.0, max=1.0)
+            else:
+                data.batch["shared_value_target_clipped"] = torch.zeros_like(
+                    value_targets, dtype=torch.bool
+                )
+            data.batch["shared_value_targets"] = value_targets
     elif adv_estimator == AdvantageEstimator.ARQ_PPO:
         arq_config = kwargs["arq_config"]
         action_valid = np.asarray(data.non_tensor_batch["is_action_valid"], dtype=bool)
@@ -811,7 +815,8 @@ class RayPPOTrainer:
             assert not config.actor_rollout_ref.model.use_fused_kernels
             assert config.actor_rollout_ref.model.get("lora_rank", 0) == 0
             assert not config.algorithm.use_kl_in_reward
-            assert shared_value.reward_max > 0
+            if bool(shared_value.get("scale_value_target", False)):
+                assert shared_value.reward_max > 0
             assert shared_value.value_cliprange >= 0
             assert shared_value.value_loss_coef >= 0
             assert 0 <= config.algorithm.gamma <= 1

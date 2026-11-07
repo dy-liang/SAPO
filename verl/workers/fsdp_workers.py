@@ -794,7 +794,9 @@ class ActorRolloutRefWorker(Worker):
             if calculate_shared_value:
                 output_tensors.update(
                     {
-                        "old_shared_value_units": auxiliary_outputs["shared_value_units"],
+                        "old_shared_value_predictions": auxiliary_outputs[
+                            "shared_value_predictions"
+                        ],
                         "old_shared_values": auxiliary_outputs["shared_values"],
                     }
                 )

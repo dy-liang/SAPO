@@ -245,12 +245,17 @@ class DataParallelPPOActor(BasePPOActor):
                 boundary_hidden = self._select_boundary_hidden(
                     hidden_states, boundary_positions[:, 0]
                 )
-                value_units = self.shared_value_head(boundary_hidden).squeeze(-1)
+                value_predictions = self.shared_value_head(boundary_hidden).squeeze(-1)
+                if bool(self.shared_value_config.get("scale_value_target", False)):
+                    shared_values = value_predictions * float(
+                        self.shared_value_config.reward_max
+                    )
+                else:
+                    shared_values = value_predictions
                 auxiliary_outputs.update(
                     {
-                        "shared_value_units": value_units,
-                        "shared_values": value_units
-                        * float(self.shared_value_config.reward_max),
+                        "shared_value_predictions": value_predictions,
+                        "shared_values": shared_values,
                     }
                 )
             captured_auxiliary_outputs.append(auxiliary_outputs)
@@ -561,7 +566,7 @@ class DataParallelPPOActor(BasePPOActor):
             "q_values": [],
             "v_logit_gaps": [],
             "q_logit_gaps": [],
-            "shared_value_units": [],
+            "shared_value_predictions": [],
             "shared_values": [],
         }
         for micro_batch in micro_batches:
@@ -641,8 +646,8 @@ class DataParallelPPOActor(BasePPOActor):
         if self.shared_value_enabled:
             select_keys.extend(
                 [
-                    "old_shared_value_units",
-                    "shared_value_target_units",
+                    "old_shared_value_predictions",
+                    "shared_value_targets",
                     "ppo_turn_unique_mask",
                 ]
             )
@@ -851,9 +856,9 @@ class DataParallelPPOActor(BasePPOActor):
                         if arq_outputs is None:
                             raise RuntimeError("SharedHead-PPO requires current value outputs")
                         value_loss, value_clipfrac = compute_arq_value_loss(
-                            current_probs=arq_outputs["shared_value_units"],
-                            old_probs=data["old_shared_value_units"],
-                            target_probs=data["shared_value_target_units"],
+                            current_probs=arq_outputs["shared_value_predictions"],
+                            old_probs=data["old_shared_value_predictions"],
+                            target_probs=data["shared_value_targets"],
                             cliprange=float(self.shared_value_config.value_cliprange),
                             sample_mask=shared_value_sample_mask,
                         )
@@ -866,14 +871,14 @@ class DataParallelPPOActor(BasePPOActor):
                             {
                                 "shared_value/value_loss": value_loss.detach().item(),
                                 "shared_value/value_clipfrac": value_clipfrac.detach().item(),
-                                "shared_value/current_units_mean": arq_outputs[
-                                    "shared_value_units"
+                                "shared_value/current_prediction_mean": arq_outputs[
+                                    "shared_value_predictions"
                                 ].detach().mean().item(),
                                 "shared_value/current_value_mean": arq_outputs[
                                     "shared_values"
                                 ].detach().mean().item(),
-                                "shared_value/target_units_mean": data[
-                                    "shared_value_target_units"
+                                "shared_value/target_mean": data[
+                                    "shared_value_targets"
                                 ].detach().mean().item(),
                             },
                         )

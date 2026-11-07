@@ -71,10 +71,11 @@ actor_rollout_ref:
     ulysses_sequence_parallel_size: 1 # sp size
     policy_loss:
       loss_mode: "vanilla"
-    # Conventional PPO value head sharing the causal-LM backbone.  The head
-    # predicts value units; multiply by reward_max before turn-level GAE.
+    # Conventional PPO value head sharing the causal-LM backbone. By default
+    # the head predicts raw return values; scaled mode is an optional ablation.
     shared_value:
       enable: False
+      scale_value_target: False
       reward_max: 10.0
       value_cliprange: 0.2
       value_loss_coef: 0.1
@@ -273,6 +274,7 @@ algorithm:
 
   shared_head_ppo:
     enable: False
+    scale_value_target: False
     reward_max: 10.0
     value_cliprange: 0.2
     value_loss_coef: 0.1
