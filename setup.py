@@ -39,6 +39,7 @@ install_requires = [
     "torchdata",
     "tensordict>=0.8.0,<=0.10.0,!=0.9.0",
     "transformers<=4.57.3",
+    "swanlab",
     "wandb",
     "packaging>=20.0",
     "qwen-vl-utils[decord]",

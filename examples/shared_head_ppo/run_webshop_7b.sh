@@ -73,7 +73,7 @@ python3 -m verl.trainer.main_ppo \
     env.rollout.n=1 \
     env.resources_per_worker.num_cpus="$num_cpus_per_env_worker" \
     trainer.critic_warmup=0 \
-    trainer.logger="['console','wandb']" \
+    trainer.logger="['console','swanlab']" \
     trainer.project_name=verl_agent_webshop \
     trainer.experiment_name=qwen2.5_7b_shared_head_ppo \
     trainer.n_gpus_per_node=2 \

@@ -18,6 +18,7 @@ tensordict<=0.6.2
 torchdata
 transformers==4.51.1
 # vllm==0.8.4
+swanlab
 wandb
 packaging>=20.0
 uvicorn

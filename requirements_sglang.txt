@@ -16,6 +16,7 @@ tensordict<=0.6.2
 torchdata
 torchvision
 transformers
+swanlab
 wandb
 sglang[all]==0.4.6.post5
 torch-memory-saver>=0.0.5
