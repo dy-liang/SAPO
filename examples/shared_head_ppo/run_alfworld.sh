@@ -23,7 +23,7 @@ python3 -m verl.trainer.main_ppo \
     algorithm.use_kl_in_reward=False \
     algorithm.shared_head_ppo.enable=True \
     algorithm.shared_head_ppo.scale_value_target=False \
-    algorithm.shared_head_ppo.value_cliprange=0.2 \
+    algorithm.shared_head_ppo.value_cliprange=2 \
     algorithm.shared_head_ppo.value_loss_coef=0.1 \
     algorithm.shared_head_ppo.normalize_turn_advantage=True \
     data.train_files="$HOME/data/verl-agent/text/train.parquet" \
