@@ -280,6 +280,38 @@ algorithm:
     value_loss_coef: 0.1
     normalize_turn_advantage: True
 
+  # Single-stream Policy Optimization. Disabled unless adv_estimator=spo.
+  # offline_values is a JSON mapping stable environment task IDs to binary
+  # rollout outcomes, matching the official SPO recipe.
+  spo:
+    enable: False
+    offline_values: null
+    offline_n: 8
+    require_offline_values: False
+    init_alpha: 0.5
+    init_beta: 0.5
+    normalize_advantage: True
+    epsilon: 1.0e-8
+    seed: 0
+    rho:
+      # "kl" uses the official mean absolute log-prob drift proxy.
+      # "constant" is useful for ablations and low-memory debugging.
+      type: kl
+      value: 0.875
+      clip_lower: 0.875
+      clip_upper: 0.96
+      d_half: 0.06
+      # 0 keeps the official unbounded per-task memory; set a positive value
+      # only for an explicitly reported memory-bounded ablation.
+      max_policy_memory_tasks: 0
+    task_sampling:
+      # Environment-level uncertainty sampling is currently supported by
+      # WebShop. ALFWorld must keep this false and therefore runs SPO-uniform.
+      enable: False
+      epsilon: 0.05
+    checkpoint_policy_memory: True
+    strict_resume: True
+
   arq:
     enable: False
     positive_token: null

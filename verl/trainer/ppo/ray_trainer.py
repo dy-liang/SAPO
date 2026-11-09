@@ -21,7 +21,7 @@ This trainer supports model-agonistic model initialization with huggingface
 import json
 import os
 import uuid
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import dataclass, field
@@ -51,6 +51,12 @@ from verl.trainer.ppo.metric_utils import (
     process_validation_metrics,
 )
 from verl.trainer.ppo.reward import compute_reward, compute_reward_async
+from verl.trainer.ppo.spo import (
+    SPOTracker,
+    compute_spo_advantages,
+    compute_spo_metrics,
+    extract_trajectory_records,
+)
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path
 from verl.utils.metric import (
     reduce_metrics,
@@ -97,6 +103,7 @@ class AdvantageEstimator(str, Enum):
     ARQ_PPO = "arq_ppo"
     PPO_TURN_GAE = "ppo_turn_gae"
     SHARED_HEAD_PPO = "shared_head_ppo"
+    SPO = "spo"
 
 
 @dataclass
@@ -402,6 +409,45 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
         data.batch["grpo_advantages"] = advantages
         data.batch["step_len_advantages"] = advantages # do not use
         data.batch["token_len_advantages"] = advantages # do not use
+    elif adv_estimator == AdvantageEstimator.SPO:
+        spo_tracker = kwargs["spo_tracker"]
+        spo_config = kwargs["spo_config"]
+        action_valid = np.asarray(data.non_tensor_batch["is_action_valid"], dtype=bool).reshape(-1)
+        invalid_action_mask = torch.as_tensor(
+            np.logical_not(action_valid),
+            dtype=torch.bool,
+            device=data.batch["response_mask"].device,
+        )
+        result = compute_spo_advantages(
+            tracker=spo_tracker,
+            task_ids=data.non_tensor_batch["spo_task_id"],
+            trajectory_ids=data.non_tensor_batch["traj_uid"],
+            binary_rewards=data.batch["spo_binary_reward"].detach().cpu().tolist(),
+            response_mask=data.batch["response_mask"],
+            unique_turn_mask=data.batch["spo_unique_turn_mask"],
+            invalid_action_mask=invalid_action_mask,
+            invalid_action_penalty_coef=float(
+                kwargs.get("invalid_action_penalty_coef", 0.0)
+            ),
+            normalize=bool(spo_config.get("normalize_advantage", True)),
+            epsilon=float(spo_config.get("epsilon", 1e-8)),
+        )
+        data.batch["advantages"] = result["advantages"]
+        data.batch["returns"] = result["returns"]
+        data.batch["grpo_advantages"] = result["advantages"]
+        data.batch["step_len_advantages"] = result["advantages"]
+        data.batch["token_len_advantages"] = result["advantages"]
+        data.batch["spo_policy_mask"] = result["policy_mask"]
+        # Reuse the actor's existing generic per-turn policy-mask hook. This is
+        # created only for SPO and therefore cannot alter other estimators.
+        data.batch["ppo_turn_policy_mask"] = result["policy_mask"]
+        data.batch["spo_unique_trajectory_mask"] = result["unique_trajectory_mask"]
+        data.batch["spo_raw_advantages"] = result["row_raw_advantages"]
+        data.batch["spo_normalized_advantages"] = result["row_normalized_advantages"]
+        data.batch["spo_policy_advantages"] = result["row_policy_advantages"]
+        data.batch["spo_p_hats"] = result["row_p_hats"]
+        data.batch["spo_binary_rewards"] = result["row_rewards"]
+        data.batch["spo_effective_ns"] = result["row_effective_ns"]
     elif adv_estimator in (
         AdvantageEstimator.PPO_TURN_GAE,
         AdvantageEstimator.SHARED_HEAD_PPO,
@@ -634,10 +680,16 @@ class RayPPOTrainer:
             AdvantageEstimator.planpo,
             AdvantageEstimator.ARQ_PPO,
             AdvantageEstimator.SHARED_HEAD_PPO,
+            AdvantageEstimator.SPO,
         ]:
             self.use_critic = False
         else:
             raise NotImplementedError
+
+        self.spo_tracker = None
+        self._spo_policy_memory = OrderedDict()
+        if self.config.algorithm.adv_estimator == AdvantageEstimator.SPO:
+            self.spo_tracker = SPOTracker(self.config.algorithm.spo)
 
         self._validate_config()
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
@@ -823,6 +875,34 @@ class RayPPOTrainer:
             assert 0 <= config.algorithm.lam <= 1
             assert config.actor_rollout_ref.actor.loss_agg_mode == "token-mean"
             assert not config.algorithm.filter_groups.enable
+
+        if config.algorithm.adv_estimator == AdvantageEstimator.SPO:
+            spo = config.algorithm.spo
+            rho = spo.rho
+            assert spo.enable, "algorithm.spo.enable must be true"
+            assert config.actor_rollout_ref.rollout.n == 1, "SPO requires one actor rollout"
+            assert config.env.rollout.n == 1, "SPO requires one environment rollout per task"
+            assert config.actor_rollout_ref.actor.ppo_epochs == 1, (
+                "This SPO integration requires ppo_epochs=1 so the policy-drift tracker has one update boundary"
+            )
+            assert not config.algorithm.filter_groups.enable, "SPO does not use group filtering"
+            assert not config.algorithm.use_kl_in_reward, (
+                "SPO's binary Beta outcome must not include reference-policy KL shaping"
+            )
+            assert config.actor_rollout_ref.actor.invalid_action_penalty_coef >= 0.0
+            assert config.actor_rollout_ref.actor.loss_agg_mode == "token-mean"
+            assert str(rho.type) in {"constant", "kl"}
+            assert 0.0 <= float(rho.value) <= 1.0
+            assert 0.0 <= float(rho.clip_lower) <= float(rho.clip_upper) <= 1.0
+            assert float(rho.d_half) > 0.0
+            assert int(rho.max_policy_memory_tasks) >= 0
+            if bool(spo.task_sampling.enable):
+                assert spo.offline_values not in (None, "", "null", "None"), (
+                    "SPO prioritized sampling requires offline_values covering the task pool"
+                )
+                assert "webshop" in str(config.env.env_name).lower(), (
+                    "Environment-level SPO prioritized sampling is currently implemented for WebShop only"
+                )
 
         if config.algorithm.adv_estimator == AdvantageEstimator.PPO_TURN_GAE:
             assert config.actor_rollout_ref.actor.strategy in ["fsdp", "fsdp2"], (
@@ -1202,6 +1282,152 @@ class RayPPOTrainer:
                 worker_group=self.actor_rollout_wg,
             )
 
+    def _spo_task_protos(self, batch: DataProto) -> dict[str, DataProto]:
+        """Build one canonical, log-prob-ready trajectory per task in this batch."""
+        task_ids = batch.non_tensor_batch["spo_task_id"]
+        trajectory_ids = batch.non_tensor_batch["traj_uid"]
+        rewards = batch.batch["spo_binary_reward"].detach().cpu().tolist()
+        record_tasks, record_trajectories, _, _ = extract_trajectory_records(
+            task_ids, trajectory_ids, rewards
+        )
+
+        # If a task appears more than once, retain its last trajectory for the
+        # next policy-drift comparison while still updating Beta once per rollout.
+        task_to_trajectory = dict(zip(record_tasks, record_trajectories))
+        unique_turn_mask = batch.batch["spo_unique_turn_mask"].detach().cpu().tolist()
+        batch_keys = ["responses", "input_ids", "attention_mask", "position_ids", "response_mask"]
+        if "loss_mask" in batch.batch:
+            batch_keys.append("loss_mask")
+        non_tensor_keys = []
+        if "multi_modal_inputs" in batch.non_tensor_batch:
+            non_tensor_keys.append("multi_modal_inputs")
+
+        result = {}
+        for task_id, trajectory_id in task_to_trajectory.items():
+            indices = [
+                row
+                for row, (row_task, row_trajectory, is_unique) in enumerate(
+                    zip(task_ids, trajectory_ids, unique_turn_mask)
+                )
+                if str(row_task) == task_id and str(row_trajectory) == trajectory_id and is_unique
+            ]
+            if not indices:
+                raise RuntimeError(f"SPO found no canonical turns for task {task_id!r}")
+            proto = batch.select_idxs(indices).select(
+                batch_keys=batch_keys,
+                non_tensor_batch_keys=non_tensor_keys,
+                deepcopy=True,
+            )
+            proto.batch = proto.batch.clone().to("cpu")
+            proto.meta_info = {
+                "temperature": batch.meta_info.get(
+                    "temperature", self.config.actor_rollout_ref.rollout.temperature
+                ),
+                "multi_turn": batch.meta_info.get("multi_turn", False),
+            }
+            result[task_id] = proto
+        return result
+
+    def _update_spo_after_actor(self, batch: DataProto) -> dict[str, float]:
+        """Compute post-update rho, update Beta statistics, and refresh policy memory."""
+        task_ids = batch.non_tensor_batch["spo_task_id"]
+        trajectory_ids = batch.non_tensor_batch["traj_uid"]
+        binary_rewards = batch.batch["spo_binary_reward"].detach().cpu().tolist()
+        record_tasks, _, record_rewards, _ = extract_trajectory_records(
+            task_ids, trajectory_ids, binary_rewards
+        )
+        unique_tasks = list(dict.fromkeys(record_tasks))
+        rho_config = self.config.algorithm.spo.rho
+        rho_type = str(rho_config.type)
+        d_by_task = {task_id: 0.0 for task_id in unique_tasks}
+        first_seen = [task_id not in self._spo_policy_memory for task_id in unique_tasks]
+
+        if rho_type == "constant":
+            first_seen = [
+                self.spo_tracker.sampled_count.get(task_id, 0) == 0
+                for task_id in unique_tasks
+            ]
+            rho_by_task = {task_id: float(rho_config.value) for task_id in unique_tasks}
+            raw_rho_by_task = dict(rho_by_task)
+        else:
+            remembered_tasks = [task_id for task_id in unique_tasks if task_id in self._spo_policy_memory]
+            if remembered_tasks:
+                past_protos = [self._spo_policy_memory[task_id]["proto"] for task_id in remembered_tasks]
+                past_batch = DataProto.concat(past_protos)
+                current_log_probs = self.actor_rollout_wg.compute_log_prob(past_batch).batch[
+                    "old_log_probs"
+                ]
+                offset = 0
+                for task_id, proto in zip(remembered_tasks, past_protos):
+                    count = len(proto)
+                    new_log_probs = current_log_probs[offset : offset + count]
+                    old_log_probs = self._spo_policy_memory[task_id]["log_probs"]
+                    mask = proto.batch["response_mask"].to(torch.bool)
+                    difference = (old_log_probs - new_log_probs).abs()
+                    denominator = mask.sum().clamp_min(1)
+                    d_by_task[task_id] = (
+                        (difference * mask).sum() / denominator
+                    ).detach().item()
+                    offset += count
+
+            d_half = float(rho_config.d_half)
+            raw_rho_by_task = {
+                task_id: 2.0 ** (-d_by_task[task_id] / d_half) for task_id in unique_tasks
+            }
+            rho_by_task = {
+                task_id: min(
+                    float(rho_config.clip_upper),
+                    max(float(rho_config.clip_lower), raw_rho_by_task[task_id]),
+                )
+                for task_id in unique_tasks
+            }
+
+            current_protos = self._spo_task_protos(batch)
+            current_batch = DataProto.concat(list(current_protos.values()))
+            post_update_log_probs = self.actor_rollout_wg.compute_log_prob(current_batch).batch[
+                "old_log_probs"
+            ]
+            offset = 0
+            for task_id, proto in current_protos.items():
+                count = len(proto)
+                self._spo_policy_memory[task_id] = {
+                    "proto": proto,
+                    "log_probs": post_update_log_probs[offset : offset + count].clone().to("cpu"),
+                }
+                self._spo_policy_memory.move_to_end(task_id)
+                offset += count
+            memory_limit = int(rho_config.max_policy_memory_tasks)
+            if memory_limit > 0:
+                while len(self._spo_policy_memory) > memory_limit:
+                    self._spo_policy_memory.popitem(last=False)
+
+        record_rhos = [rho_by_task[task_id] for task_id in record_tasks]
+        self.spo_tracker.update(record_tasks, record_rewards, record_rhos)
+        sampled_counts = np.asarray(
+            [self.spo_tracker.sampled_count[task_id] for task_id in record_tasks], dtype=np.float32
+        )
+        alpha = np.asarray([self.spo_tracker.alpha[task_id] for task_id in record_tasks])
+        beta = np.asarray([self.spo_tracker.beta[task_id] for task_id in record_tasks])
+        raw_rhos = np.asarray([raw_rho_by_task[task_id] for task_id in unique_tasks])
+        clipped_rhos = np.asarray([rho_by_task[task_id] for task_id in unique_tasks])
+        ds = np.asarray([d_by_task[task_id] for task_id in unique_tasks])
+        return {
+            "spo/rho": float(raw_rhos.mean()),
+            "spo/rho_clipped": float(clipped_rhos.mean()),
+            "spo/rho_clip_ratio": float(np.mean(raw_rhos != clipped_rhos)),
+            "spo/D": float(ds.mean()),
+            "spo/first_sampled_ratio": float(np.mean(first_seen)),
+            "spo/alpha": float(alpha.mean()),
+            "spo/beta": float(beta.mean()),
+            "spo/cur_sampled_number/min": float(sampled_counts.min()),
+            "spo/cur_sampled_number/max": float(sampled_counts.max()),
+            "spo/cur_sampled_number/mean": float(sampled_counts.mean()),
+            "spo/duplicate_task_fraction": float(
+                1.0 - len(unique_tasks) / max(len(record_tasks), 1)
+            ),
+            "spo/policy_memory_tasks": float(len(self._spo_policy_memory)),
+        }
+
     def _save_checkpoint(self):
         # path: given_path + `/global_step_{global_steps}` + `/actor`
         local_global_step_folder = os.path.join(self.config.trainer.default_local_dir, f"global_step_{self.global_steps}")
@@ -1228,6 +1454,12 @@ class RayPPOTrainer:
         dataloader_local_path = os.path.join(local_global_step_folder, "data.pt")
         dataloader_state_dict = self.train_dataloader.state_dict()
         torch.save(dataloader_state_dict, dataloader_local_path)
+
+        if self.spo_tracker is not None:
+            spo_state = {"tracker": self.spo_tracker.state_dict()}
+            if bool(self.config.algorithm.spo.checkpoint_policy_memory):
+                spo_state["policy_memory"] = self._spo_policy_memory
+            torch.save(spo_state, os.path.join(local_global_step_folder, "spo_state.pt"))
 
         # latest checkpointed iteration tracker (for atomic usage)
         local_latest_checkpointed_iteration = os.path.join(self.config.trainer.default_local_dir, "latest_checkpointed_iteration.txt")
@@ -1284,6 +1516,22 @@ class RayPPOTrainer:
             self.train_dataloader.load_state_dict(dataloader_state_dict)
         else:
             print(f"Warning: No dataloader state found at {dataloader_local_path}, will start from scratch")
+
+        if self.spo_tracker is not None:
+            spo_state_path = os.path.join(global_step_folder, "spo_state.pt")
+            if os.path.exists(spo_state_path):
+                spo_state = torch.load(spo_state_path, map_location="cpu", weights_only=False)
+                self.spo_tracker.load_state_dict(spo_state["tracker"])
+                self._spo_policy_memory = spo_state.get("policy_memory", OrderedDict())
+                if not isinstance(self._spo_policy_memory, OrderedDict):
+                    self._spo_policy_memory = OrderedDict(self._spo_policy_memory)
+            elif bool(self.config.algorithm.spo.strict_resume):
+                raise FileNotFoundError(
+                    f"SPO checkpoint state is missing: {spo_state_path}. "
+                    "Set algorithm.spo.strict_resume=false only for an intentional reset ablation."
+                )
+            else:
+                print(f"Warning: No SPO state found at {spo_state_path}; tracker was reinitialized")
 
     def _balance_batch(self, batch: DataProto, metrics, logging_prefix="global_seqlen"):
         """Reorder the data on single controller such that each dp rank gets similar total tokens"""
@@ -1366,6 +1614,17 @@ class RayPPOTrainer:
                 with _timer("step", timing_raw):
                     # generate a batch
                     with _timer("gen", timing_raw):
+                        if (
+                            self.config.algorithm.adv_estimator == AdvantageEstimator.SPO
+                            and bool(self.config.algorithm.spo.task_sampling.enable)
+                        ):
+                            sampling_epsilon = float(
+                                self.config.algorithm.spo.task_sampling.epsilon
+                            )
+                            self.envs.set_task_sampling_weights(
+                                task_weights=self.spo_tracker.sampling_weights(sampling_epsilon),
+                                default_weight=(0.25 ** 0.5) + sampling_epsilon,
+                            )
                         # if not self.async_rollout_mode:
                         #     gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
                         # else:
@@ -1418,6 +1677,24 @@ class RayPPOTrainer:
 
                     batch = adjust_batch(self.config, batch)
 
+                    if self.config.algorithm.adv_estimator == AdvantageEstimator.SPO:
+                        # adjust_batch may append arbitrary turn copies. Keep one
+                        # policy-bearing row per real environment transition.
+                        seen_turns = set()
+                        unique_turn_rows = []
+                        turn_indices = batch.batch["turn_index"].detach().cpu().tolist()
+                        for trajectory_id, turn_index in zip(
+                            batch.non_tensor_batch["traj_uid"], turn_indices
+                        ):
+                            key = (str(trajectory_id), int(turn_index))
+                            unique_turn_rows.append(key not in seen_turns)
+                            seen_turns.add(key)
+                        batch.batch["spo_unique_turn_mask"] = torch.tensor(
+                            unique_turn_rows,
+                            dtype=torch.bool,
+                            device=batch.batch["turn_index"].device,
+                        )
+
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.ARQ_PPO:
                         # adjust_batch appends randomly selected padding copies.
                         # Mark the first occurrence before balance_batch shuffles
@@ -1461,6 +1738,15 @@ class RayPPOTrainer:
                         )
 
                     batch.batch["response_mask"] = compute_response_mask(batch)
+                    if self.config.algorithm.adv_estimator == AdvantageEstimator.SPO:
+                        spo_policy_mask = (
+                            batch.batch["response_mask"].bool()
+                            & batch.batch["spo_unique_turn_mask"].unsqueeze(-1)
+                        )
+                        batch.batch["spo_policy_mask"] = spo_policy_mask
+                        # DataParallelPPOActor already treats this key as the
+                        # authoritative policy/entropy/KL mask.
+                        batch.batch["ppo_turn_policy_mask"] = spo_policy_mask
                     if self.config.algorithm.adv_estimator in (
                         AdvantageEstimator.PPO_TURN_GAE,
                         AdvantageEstimator.SHARED_HEAD_PPO,
@@ -1596,10 +1882,11 @@ class RayPPOTrainer:
                             elif self.config.algorithm.adv_estimator in (
                                 AdvantageEstimator.PPO_TURN_GAE,
                                 AdvantageEstimator.SHARED_HEAD_PPO,
+                                AdvantageEstimator.SPO,
                             ):
-                                # PPO turn GAE likewise keeps invalid-action
-                                # shaping out of rewards and critic targets; it
-                                # is applied to the policy advantage only.
+                                # These estimators keep invalid-action shaping
+                                # out of value/Beta targets and apply it only to
+                                # the policy advantage.
                                 valid_action_ratio = np.mean(
                                     batch.non_tensor_batch['is_action_valid'].astype(np.float32)
                                 ).item()
@@ -1644,6 +1931,8 @@ class RayPPOTrainer:
                             arq_config=self.config.algorithm.arq,
                             ppo_turn_gae_config=self.config.algorithm.get("ppo_turn_gae", {}),
                             shared_head_ppo_config=self.config.algorithm.get("shared_head_ppo", {}),
+                            spo_config=self.config.algorithm.get("spo", {}),
+                            spo_tracker=self.spo_tracker,
                             global_step=self.global_steps,
                             total_training_steps=self.total_training_steps,
                             invalid_action_penalty_coef=(
@@ -1652,6 +1941,8 @@ class RayPPOTrainer:
                                 else 0.0
                             ),
                         )
+                        if self.config.algorithm.adv_estimator == AdvantageEstimator.SPO:
+                            metrics.update(compute_spo_metrics(batch))
 
                     # update critic
                     if self.use_critic:
@@ -1668,6 +1959,9 @@ class RayPPOTrainer:
                             actor_output = self.actor_rollout_wg.update_actor(batch)
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)
+                        if self.config.algorithm.adv_estimator == AdvantageEstimator.SPO:
+                            with _timer("spo_update", timing_raw):
+                                metrics.update(self._update_spo_after_actor(batch))
 
                     # Log rollout generations if enabled
                     rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)

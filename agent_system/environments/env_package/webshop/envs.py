@@ -36,6 +36,7 @@ class WebshopWorker:
         
         env_kwargs['seed'] = seed
         self.env = gym.make('WebAgentTextEnv-v0', **env_kwargs)
+        self.task_id = None
     
     def step(self, action):
         """Execute a step in the environment"""
@@ -43,6 +44,7 @@ class WebshopWorker:
         info = dict(info or {})  # make a *copy* so we can mutate safely
         info['available_actions'] = self.env.get_available_actions()
         info['task_score'] = reward
+        info['task_id'] = self.task_id
 
         # Redefine reward. We only use rule-based reward - win for 10, lose for 0.
         if done and reward == 1.0:
@@ -56,10 +58,12 @@ class WebshopWorker:
     
     def reset(self, idx):
         """Reset the environment with given session index"""
+        self.task_id = int(idx)
         obs, info = self.env.reset(session=idx)
         info = dict(info or {})
         info['available_actions'] = self.env.get_available_actions()
         info['won'] = False
+        info['task_id'] = self.task_id
         return obs, info
     
     def render(self, mode_for_render):
@@ -113,6 +117,8 @@ class WebshopMultiProcessEnv(gym.Env):
         if not is_train: assert group_n == 1
 
         self._rng = np.random.RandomState(seed)
+        self._task_sampling_weights = None
+        self._task_sampling_default_weight = 1.0
 
         self._env_kwargs = env_kwargs if env_kwargs is not None else {'observation_mode': 'text', 'num_products': None}
 
@@ -145,6 +151,18 @@ class WebshopMultiProcessEnv(gym.Env):
             
         print(self.goal_idxs)
 
+    def set_task_sampling_weights(self, task_weights: dict[str, float], default_weight: float) -> None:
+        """Set SPO uncertainty weights without changing non-SPO reset behavior."""
+        if not self.is_train:
+            raise ValueError("Task-priority sampling is only valid for training environments")
+        parsed = {}
+        for task_id, weight in task_weights.items():
+            parsed[int(task_id)] = float(weight)
+        if default_weight <= 0.0 or any(weight <= 0.0 for weight in parsed.values()):
+            raise ValueError("WebShop task sampling weights must be positive")
+        self._task_sampling_weights = parsed
+        self._task_sampling_default_weight = float(default_weight)
+
     # ------------------------------------------------------------------
     # Base API ----------------------------------------------------------
     # ------------------------------------------------------------------
@@ -173,7 +191,23 @@ class WebshopMultiProcessEnv(gym.Env):
         return obs_list, reward_list, done_list, info_list
 
     def reset(self):
-        idx = self._rng.choice(self.goal_idxs, size=self.env_num, replace=False)
+        goal_idxs = np.asarray(list(self.goal_idxs), dtype=np.int64)
+        probabilities = None
+        if self._task_sampling_weights is not None:
+            weights = np.asarray(
+                [
+                    self._task_sampling_weights.get(int(task_id), self._task_sampling_default_weight)
+                    for task_id in goal_idxs
+                ],
+                dtype=np.float64,
+            )
+            probabilities = weights / weights.sum()
+        idx = self._rng.choice(
+            goal_idxs,
+            size=self.env_num,
+            replace=self.env_num > len(goal_idxs),
+            p=probabilities,
+        )
         idx = np.repeat(idx, self.group_n).tolist()
 
         # Send reset commands to all workers

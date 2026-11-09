@@ -114,8 +114,11 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> Dict[str,
     prompt_mask = batch.batch["attention_mask"][:, :-max_response_length].bool()
     response_mask = batch.batch["attention_mask"][:, -max_response_length:].bool()
     ppo_turn_unique_mask = batch.batch.get("ppo_turn_unique_mask")
+    spo_unique_turn_mask = batch.batch.get("spo_unique_turn_mask")
+    metric_row_mask = None
     if ppo_turn_unique_mask is not None:
         ppo_turn_unique_mask = ppo_turn_unique_mask.bool()
+        metric_row_mask = ppo_turn_unique_mask
         policy_metric_mask = batch.batch["ppo_turn_policy_mask"].bool()
         value_metric_mask = batch.batch["ppo_turn_value_mask"].bool()
         # Report the reward actually used by the new estimator, rather than
@@ -123,6 +126,17 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> Dict[str,
         sequence_reward = batch.batch["env_reward"].to(torch.float32)
         sequence_score = sequence_score[ppo_turn_unique_mask]
         sequence_reward = sequence_reward[ppo_turn_unique_mask]
+    elif spo_unique_turn_mask is not None:
+        spo_unique_turn_mask = spo_unique_turn_mask.bool()
+        metric_row_mask = spo_unique_turn_mask
+        policy_metric_mask = batch.batch["spo_policy_mask"].bool()
+        value_metric_mask = policy_metric_mask
+        # SPO is defined on binary trajectory success, not the environment's
+        # shaped/10-point score retained for other algorithms.
+        sequence_score = sequence_score[spo_unique_turn_mask]
+        sequence_reward = batch.batch["spo_binary_reward"][spo_unique_turn_mask].to(
+            torch.float32
+        )
     else:
         policy_metric_mask = response_mask
         value_metric_mask = response_mask
@@ -133,13 +147,13 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> Dict[str,
     prompt_length = response_info["prompt_length"]
     response_length = response_info["response_length"]
     metric_prompt_length = (
-        prompt_length[ppo_turn_unique_mask]
-        if ppo_turn_unique_mask is not None
+        prompt_length[metric_row_mask]
+        if metric_row_mask is not None
         else prompt_length
     )
     metric_response_length = (
-        response_length[ppo_turn_unique_mask]
-        if ppo_turn_unique_mask is not None
+        response_length[metric_row_mask]
+        if metric_row_mask is not None
         else response_length
     )
 

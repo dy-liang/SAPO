@@ -45,6 +45,15 @@ class EnvironmentManagerBase:
         self.projection_f = projection_f
         self.config = config
 
+    def set_task_sampling_weights(self, task_weights: Dict[str, float], default_weight: float) -> None:
+        """Forward optional task-priority weights to a supporting environment."""
+        setter = getattr(self.envs, "set_task_sampling_weights", None)
+        if setter is None:
+            raise NotImplementedError(
+                f"{type(self.envs).__name__} does not support explicit task-priority sampling"
+            )
+        setter(task_weights=task_weights, default_weight=default_weight)
+
     def reset(self, kwargs) -> Dict[str, Any]:
         """
         Reset all environments and return the initial observations.

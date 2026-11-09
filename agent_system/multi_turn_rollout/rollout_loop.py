@@ -253,6 +253,7 @@ class TrajectoryCollector:
             DataProto: Collected and organized trajectory data
         """
         batch_size = len(total_batch_list)
+        spo_enabled = str(self.config.algorithm.adv_estimator) == "spo"
 
         success_rate = {}
         for key, value in success.items():
@@ -278,6 +279,10 @@ class TrajectoryCollector:
                 # success_rate
                 for key, value in success_rate.items():
                     data[key] = value
+                if spo_enabled:
+                    data['spo_binary_reward'] = torch.tensor(
+                        float(success['success_rate'][bs]), dtype=torch.float32
+                    )
 
                 effective_batch.append(data)
             
@@ -312,6 +317,19 @@ class TrajectoryCollector:
 
         # Initial observations from the environment
         obs, infos = envs.reset(kwargs=gen_batch.non_tensor_batch.pop('env_kwargs', None))
+
+        spo_enabled = str(self.config.algorithm.adv_estimator) == "spo"
+        spo_task_ids = None
+        if spo_enabled:
+            spo_task_ids = []
+            for info in infos:
+                task_id = info.get('task_id', info.get('extra.gamefile'))
+                if task_id is None or not str(task_id).strip():
+                    raise ValueError(
+                        "SPO requires a stable task ID in info['task_id'] or info['extra.gamefile']"
+                    )
+                spo_task_ids.append(str(task_id).strip())
+            spo_task_ids = np.asarray(spo_task_ids, dtype=object)
 
         lenght_obs = len(obs['text']) if obs['text'] is not None else len(obs['image'])
         assert len(gen_batch.batch) == lenght_obs, f"gen_batch size {len(gen_batch.batch)} does not match obs size {lenght_obs}"
@@ -362,6 +380,8 @@ class TrajectoryCollector:
 
             batch.non_tensor_batch['uid'] = uid_batch
             batch.non_tensor_batch['traj_uid'] = traj_uid
+            if spo_enabled:
+                batch.non_tensor_batch['spo_task_id'] = spo_task_ids
 
             batch = batch.union(batch_output)
             
