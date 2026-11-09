@@ -1328,6 +1328,15 @@ class RayPPOTrainer:
             result[task_id] = proto
         return result
 
+    def _spo_compute_log_prob(self, batch: DataProto) -> torch.Tensor:
+        """Recompute SPO log probabilities with an equal shard for every DP worker."""
+        padded_batch, pad_size = pad_dataproto_to_divisor(
+            batch, self.actor_rollout_wg.world_size
+        )
+        output = self.actor_rollout_wg.compute_log_prob(padded_batch)
+        output = unpad_dataproto(output, pad_size)
+        return output.batch["old_log_probs"]
+
     def _update_spo_after_actor(self, batch: DataProto) -> dict[str, float]:
         """Compute post-update rho, update Beta statistics, and refresh policy memory."""
         task_ids = batch.non_tensor_batch["spo_task_id"]
@@ -1354,9 +1363,7 @@ class RayPPOTrainer:
             if remembered_tasks:
                 past_protos = [self._spo_policy_memory[task_id]["proto"] for task_id in remembered_tasks]
                 past_batch = DataProto.concat(past_protos)
-                current_log_probs = self.actor_rollout_wg.compute_log_prob(past_batch).batch[
-                    "old_log_probs"
-                ]
+                current_log_probs = self._spo_compute_log_prob(past_batch)
                 offset = 0
                 for task_id, proto in zip(remembered_tasks, past_protos):
                     count = len(proto)
@@ -1384,9 +1391,7 @@ class RayPPOTrainer:
 
             current_protos = self._spo_task_protos(batch)
             current_batch = DataProto.concat(list(current_protos.values()))
-            post_update_log_probs = self.actor_rollout_wg.compute_log_prob(current_batch).batch[
-                "old_log_probs"
-            ]
+            post_update_log_probs = self._spo_compute_log_prob(current_batch)
             offset = 0
             for task_id, proto in current_protos.items():
                 count = len(proto)
