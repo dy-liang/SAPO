@@ -119,6 +119,7 @@ class WebshopMultiProcessEnv(gym.Env):
         self._rng = np.random.RandomState(seed)
         self._task_sampling_weights = None
         self._task_sampling_default_weight = 1.0
+        self._forced_task_ids = None
 
         self._env_kwargs = env_kwargs if env_kwargs is not None else {'observation_mode': 'text', 'num_products': None}
 
@@ -150,6 +151,26 @@ class WebshopMultiProcessEnv(gym.Env):
             self.goal_idxs = range(500, len(goals))
             
         print(self.goal_idxs)
+
+    def get_all_train_task_ids(self):
+        if not self.is_train:
+            raise ValueError("Only the WebShop training environment exposes train task IDs")
+        return [str(task_id) for task_id in self.goal_idxs]
+
+    def set_forced_task_ids(self, task_ids):
+        parsed = [int(task_id) for task_id in task_ids]
+        if len(parsed) != self.num_processes:
+            raise ValueError(
+                f"Expected {self.num_processes} forced WebShop tasks, got {len(parsed)}"
+            )
+        valid_tasks = set(self.goal_idxs)
+        unknown = [task_id for task_id in parsed if task_id not in valid_tasks]
+        if unknown:
+            raise ValueError(f"Unknown WebShop training task IDs: {unknown[:5]}")
+        self._forced_task_ids = parsed
+
+    def clear_forced_task_ids(self):
+        self._forced_task_ids = None
 
     def set_task_sampling_weights(self, task_weights: dict[str, float], default_weight: float) -> None:
         """Set SPO uncertainty weights without changing non-SPO reset behavior."""
@@ -191,24 +212,27 @@ class WebshopMultiProcessEnv(gym.Env):
         return obs_list, reward_list, done_list, info_list
 
     def reset(self):
-        goal_idxs = np.asarray(list(self.goal_idxs), dtype=np.int64)
-        probabilities = None
-        if self._task_sampling_weights is not None:
-            weights = np.asarray(
-                [
-                    self._task_sampling_weights.get(int(task_id), self._task_sampling_default_weight)
-                    for task_id in goal_idxs
-                ],
-                dtype=np.float64,
+        if self._forced_task_ids is not None:
+            idx = list(self._forced_task_ids)
+        else:
+            goal_idxs = np.asarray(list(self.goal_idxs), dtype=np.int64)
+            probabilities = None
+            if self._task_sampling_weights is not None:
+                weights = np.asarray(
+                    [
+                        self._task_sampling_weights.get(int(task_id), self._task_sampling_default_weight)
+                        for task_id in goal_idxs
+                    ],
+                    dtype=np.float64,
+                )
+                probabilities = weights / weights.sum()
+            idx = self._rng.choice(
+                goal_idxs,
+                size=self.env_num,
+                replace=self.env_num > len(goal_idxs),
+                p=probabilities,
             )
-            probabilities = weights / weights.sum()
-        idx = self._rng.choice(
-            goal_idxs,
-            size=self.env_num,
-            replace=self.env_num > len(goal_idxs),
-            p=probabilities,
-        )
-        idx = np.repeat(idx, self.group_n).tolist()
+            idx = np.repeat(idx, self.group_n).tolist()
 
         # Send reset commands to all workers
         futures = []

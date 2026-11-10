@@ -7,9 +7,16 @@ It is disabled unless both `algorithm.adv_estimator=spo` and
 
 ## Offline values
 
-Canonical SPO uses eight initial-policy rollouts per training task. Pass a JSON
-file whose keys exactly match the stable environment task IDs and whose values
-are rollout outcome lists:
+Canonical SPO uses eight initial-policy rollouts per training task. The launch
+scripts now default to `algorithm.spo.initialization.mode=collect`: before the
+first optimizer step, the frozen initial policy is run eight times on every
+training task and the binary outcomes initialize the Beta tracker. The results
+are cached as `spo_initial_values.json` under the experiment checkpoint folder
+and reused on restart.
+
+To reuse a separately generated JSON instead, set `SPO_OFFLINE_VALUES`. Its keys
+must exactly match the stable environment task IDs and its values must be rollout
+outcome lists:
 
 ```json
 {
@@ -23,17 +30,24 @@ For a canonical run, set:
 
 ```bash
 SPO_OFFLINE_VALUES=/path/to/offline_values.json \
-SPO_REQUIRE_OFFLINE_VALUES=True \
 SPO_TASK_SAMPLING=True \
 bash examples/spo_trainer/run_webshop_7b.sh
 ```
 
-Without `SPO_OFFLINE_VALUES`, the tracker starts from Beta(0.5, 0.5); this is
-the `SPO-no-init` ablation, not the paper's main configuration.
+The `SPO-no-init` ablation must be requested explicitly:
+
+```bash
+SPO_INIT_MODE=none bash examples/spo_trainer/run_alfworld.sh
+```
+
+In canonical `collect` or `offline` mode, missing task values emit a warning and
+fall back to Beta(0.5, 0.5). Set `SPO_STRICT_TASK_COVERAGE=True` to make a
+coverage mismatch fatal.
 
 WebShop supports the paper's uncertainty-prioritized task sampling. The bundled
-ALFWorld vector environment does not expose a safe reset-to-gamefile API, so its
-script deliberately runs `SPO-uniform` and says so in the experiment name.
+ALFWorld vector environment now uses explicit gamefile assignment only during
+the init-8 warm-up. Its subsequent online training still samples uniformly, so
+the script deliberately reports `SPO-uniform` in the experiment name.
 
 The scripts without a model-size suffix use Qwen2.5-1.5B-Instruct; the
 `run_*_7b.sh` scripts use Qwen2.5-7B-Instruct.

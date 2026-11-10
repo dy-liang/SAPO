@@ -242,7 +242,7 @@ class AlfredTWEnv(object):
 
         return trajectory
 
-    def init_env(self, batch_size):
+    def init_env(self, batch_size, game_files=None):
         domain_randomization = self.config["env"]["domain_randomization"]
         if self.train_eval != "train":
             domain_randomization = False
@@ -270,7 +270,10 @@ class AlfredTWEnv(object):
         else:
             raise NotImplementedError
 
-        env_id = textworld.gym.register_games(self.game_files, request_infos,
+        selected_game_files = self.game_files if game_files is None else list(game_files)
+        if not selected_game_files:
+            raise ValueError("AlfredTWEnv requires at least one game file")
+        env_id = textworld.gym.register_games(selected_game_files, request_infos,
                                               batch_size=batch_size,
                                               asynchronous=True,
                                               max_episode_steps=max_nb_steps_per_episode,

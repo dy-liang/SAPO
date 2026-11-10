@@ -896,10 +896,23 @@ class RayPPOTrainer:
             assert 0.0 <= float(rho.clip_lower) <= float(rho.clip_upper) <= 1.0
             assert float(rho.d_half) > 0.0
             assert int(rho.max_policy_memory_tasks) >= 0
-            if bool(spo.task_sampling.enable):
-                assert spo.offline_values not in (None, "", "null", "None"), (
-                    "SPO prioritized sampling requires offline_values covering the task pool"
+            initialization = spo.initialization
+            assert str(initialization.mode) in {"collect", "offline", "none"}
+            assert int(initialization.rollouts_per_task) >= 0
+            if str(initialization.mode) != "none":
+                assert int(initialization.rollouts_per_task) == int(spo.offline_n), (
+                    "SPO initialization.rollouts_per_task must equal offline_n"
                 )
+            if str(initialization.mode) == "offline":
+                assert spo.offline_values not in (None, "", "null", "None"), (
+                    "SPO offline initialization requires algorithm.spo.offline_values"
+                )
+            else:
+                assert spo.offline_values in (None, "", "null", "None"), (
+                    "algorithm.spo.offline_values is only valid when "
+                    "algorithm.spo.initialization.mode=offline"
+                )
+            if bool(spo.task_sampling.enable):
                 assert "webshop" in str(config.env.env_name).lower(), (
                     "Environment-level SPO prioritized sampling is currently implemented for WebShop only"
                 )
@@ -1551,6 +1564,156 @@ class RayPPOTrainer:
         global_balance_stats = log_seqlen_unbalance(seqlen_list=global_seqlen_lst, partitions=global_partition_lst, prefix=logging_prefix)
         metrics.update(global_balance_stats)
 
+    def _spo_init_cache_path(self) -> str:
+        configured = self.config.algorithm.spo.initialization.get("cache_path", None)
+        if configured not in (None, "", "null", "None"):
+            return os.path.abspath(os.path.expanduser(str(configured)))
+        return os.path.abspath(
+            os.path.join(self.config.trainer.default_local_dir, "spo_initial_values.json")
+        )
+
+    def _validate_spo_initialization_coverage(self, task_ids) -> None:
+        expected = {self.spo_tracker.canonical_task_id(task_id) for task_id in task_ids}
+        initialized = set(self.spo_tracker.initialized_task_ids)
+        missing = sorted(expected - initialized)
+        if missing:
+            message = (
+                f"SPO initialization is missing {len(missing)} training tasks; "
+                f"examples: {missing[:5]}"
+            )
+            if bool(self.config.algorithm.spo.initialization.strict_task_coverage):
+                raise RuntimeError(message)
+            print(f"Warning: {message}. They will use Beta(0.5, 0.5).")
+
+    def _spo_initialization_gen_batch(self) -> DataProto:
+        """Build a reusable prompt batch without advancing the training loader."""
+        dataloader_state = deepcopy(self.train_dataloader.state_dict())
+        try:
+            batch_dict = next(iter(self.train_dataloader))
+        finally:
+            self.train_dataloader.load_state_dict(dataloader_state)
+
+        batch = DataProto.from_single_dict(batch_dict)
+        batch_keys = ["input_ids", "attention_mask", "position_ids"]
+        non_tensor_keys = ["raw_prompt_ids", "data_source"]
+        for key in ("multi_modal_data", "raw_prompt", "tools_kwargs", "env_kwargs"):
+            if key in batch.non_tensor_batch:
+                non_tensor_keys.append(key)
+        return batch.pop(
+            batch_keys=batch_keys,
+            non_tensor_batch_keys=non_tensor_keys,
+        )
+
+    def _save_spo_initial_values(self, path: str, values: dict[str, list[float]]) -> None:
+        directory = os.path.dirname(path)
+        os.makedirs(directory, exist_ok=True)
+        temporary_path = f"{path}.tmp"
+        with open(temporary_path, "w", encoding="utf-8") as handle:
+            json.dump(values, handle, ensure_ascii=False, sort_keys=True)
+        os.replace(temporary_path, path)
+
+    def _initialize_spo_tracker(self) -> None:
+        """Run canonical initial-policy rollouts before the first actor update."""
+        initialization = self.config.algorithm.spo.initialization
+        mode = str(initialization.mode)
+        task_ids = list(dict.fromkeys(self.envs.get_all_train_task_ids()))
+        if not task_ids:
+            raise RuntimeError("SPO initialization found no training tasks")
+
+        if mode == "none":
+            self.spo_tracker.initialization_complete = True
+            print("SPO-no-init ablation: tracker starts from Beta(0.5, 0.5)")
+            return
+
+        if mode == "offline":
+            self._validate_spo_initialization_coverage(task_ids)
+            self.spo_tracker.initialization_complete = True
+            print(f"Loaded canonical SPO init-8 values for {len(task_ids)} tasks")
+            return
+
+        if mode != "collect":
+            raise ValueError(f"Unsupported SPO initialization mode: {mode}")
+
+        cache_path = self._spo_init_cache_path()
+        if bool(initialization.reuse_cache) and os.path.exists(cache_path):
+            self.spo_tracker.load_offline_values(cache_path)
+            self._validate_spo_initialization_coverage(task_ids)
+            self.spo_tracker.initialization_complete = True
+            print(f"Reused canonical SPO init-8 cache: {cache_path}")
+            return
+
+        num_rollouts = int(initialization.rollouts_per_task)
+        batch_size = int(self.config.data.train_batch_size)
+        gen_batch = self._spo_initialization_gen_batch()
+        if len(gen_batch.batch) != batch_size:
+            raise RuntimeError(
+                f"SPO init expected generation batch size {batch_size}, got {len(gen_batch.batch)}"
+            )
+
+        initial_values = {str(task_id): [] for task_id in task_ids}
+        print(
+            f"Collecting {num_rollouts} initial-policy rollouts for "
+            f"{len(task_ids)} SPO tasks before training"
+        )
+
+        try:
+            for start in tqdm(
+                range(0, len(task_ids), batch_size),
+                desc="SPO init-8 task batches",
+            ):
+                task_batch = task_ids[start : start + batch_size]
+                forced_tasks = list(task_batch)
+                while len(forced_tasks) < batch_size:
+                    forced_tasks.append(task_ids[len(forced_tasks) % len(task_ids)])
+                self.envs.set_forced_task_ids(forced_tasks)
+
+                for _ in range(num_rollouts):
+                    rollout = self.traj_collector.multi_turn_loop(
+                        gen_batch=deepcopy(gen_batch),
+                        actor_rollout_wg=self.actor_rollout_wg,
+                        envs=self.envs,
+                        is_train=True,
+                    )
+                    record_tasks, _, record_rewards, _ = extract_trajectory_records(
+                        rollout.non_tensor_batch["spo_task_id"],
+                        rollout.non_tensor_batch["traj_uid"],
+                        rollout.batch["spo_binary_reward"].detach().cpu().tolist(),
+                    )
+                    for task_id, reward in zip(record_tasks, record_rewards):
+                        values = initial_values.get(task_id)
+                        if values is not None and len(values) < num_rollouts:
+                            values.append(float(reward))
+                    del rollout
+        finally:
+            self.envs.clear_forced_task_ids()
+
+        incomplete = {
+            task_id: len(values)
+            for task_id, values in initial_values.items()
+            if len(values) != num_rollouts
+        }
+        if incomplete:
+            examples = list(incomplete.items())[:5]
+            message = (
+                f"SPO init-8 did not collect exactly {num_rollouts} rollouts for "
+                f"{len(incomplete)} tasks; examples: {examples}"
+            )
+            if bool(initialization.strict_task_coverage):
+                raise RuntimeError(message)
+            print(f"Warning: {message}. They will use Beta(0.5, 0.5).")
+
+        completed_values = {
+            task_id: values
+            for task_id, values in initial_values.items()
+            if len(values) == num_rollouts
+        }
+        for task_id, values in completed_values.items():
+            self.spo_tracker.initialize_task(task_id, values)
+        self._validate_spo_initialization_coverage(task_ids)
+        self.spo_tracker.initialization_complete = True
+        self._save_spo_initial_values(cache_path, completed_values)
+        print(f"Saved canonical SPO init-8 cache: {cache_path}")
+
     def fit(self):
         """
         The training loop of PPO.
@@ -1573,6 +1736,15 @@ class RayPPOTrainer:
 
         # load checkpoint before doing anything
         self._load_checkpoint()
+
+        # Canonical SPO performs all initial-policy task rollouts before the
+        # first validation/training update. Resumed checkpoints carry this
+        # completion bit and therefore never repeat initialization.
+        if (
+            self.config.algorithm.adv_estimator == AdvantageEstimator.SPO
+            and not self.spo_tracker.initialization_complete
+        ):
+            self._initialize_spo_tracker()
 
         # perform validation before training
         # currently, we only support validation using the reward_function.

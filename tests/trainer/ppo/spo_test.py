@@ -22,6 +22,48 @@ def test_offline_initialization_matches_official_recipe(tmp_path):
     assert tracker.value("task-a") == pytest.approx(0.5)
 
 
+def test_canonical_init_requires_every_task_and_roundtrips_state():
+    config = {
+        "offline_n": 8,
+        "initialization": {
+            "mode": "collect",
+            "strict_task_coverage": True,
+        },
+        "rho": {"clip_lower": 0.875},
+    }
+    tracker = SPOTracker(config)
+
+    with pytest.raises(RuntimeError, match="no initial-policy tracker values"):
+        tracker.value("missing")
+
+    tracker.initialize_task("task-a", [0, 1, 0, 0, 1, 0, 0, 1])
+    tracker.initialization_complete = True
+    assert tracker.value("task-a") == pytest.approx(3.5 / 9.0)
+    assert tracker.alpha["task-a"] + tracker.beta["task-a"] == pytest.approx(8.0)
+
+    restored = SPOTracker(config)
+    restored.load_state_dict(tracker.state_dict())
+    assert restored.initialized_task_ids == {"task-a"}
+    assert restored.initialization_complete
+    assert restored.value("task-a") == pytest.approx(tracker.value("task-a"))
+
+
+def test_non_strict_init_falls_back_for_unseen_task():
+    tracker = SPOTracker(
+        {
+            "offline_n": 8,
+            "initialization": {
+                "mode": "collect",
+                "strict_task_coverage": False,
+            },
+        }
+    )
+
+    assert tracker.value("unseen-task") == pytest.approx(0.5)
+    assert tracker.alpha["unseen-task"] == pytest.approx(0.5)
+    assert tracker.beta["unseen-task"] == pytest.approx(0.5)
+
+
 def test_advantage_is_per_trajectory_and_padding_copy_is_masked():
     tracker = SPOTracker({})
     tracker.alpha.update({"a": 1.0, "b": 3.0})

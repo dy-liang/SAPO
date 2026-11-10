@@ -39,6 +39,16 @@ class SPOTracker:
         self.seed = int(_config_get(config, "seed", 0))
         self._rng = random.Random(self.seed)
 
+        initialization_config = _config_get(config, "initialization", {})
+        self.initialization_mode = str(_config_get(initialization_config, "mode", "none"))
+        self.strict_task_coverage = bool(
+            _config_get(initialization_config, "strict_task_coverage", False)
+        )
+        if self.initialization_mode not in {"collect", "offline", "none"}:
+            raise ValueError(
+                "SPO initialization.mode must be one of: collect, offline, none"
+            )
+
         rho_config = _config_get(config, "rho", {})
         self.rho_clip_lower = float(_config_get(rho_config, "clip_lower", 0.875))
         if not 0.0 <= self.rho_clip_lower < 1.0:
@@ -51,6 +61,8 @@ class SPOTracker:
         self.alpha: dict[str, float] = {}
         self.beta: dict[str, float] = {}
         self.sampled_count: dict[str, int] = {}
+        self.initialized_task_ids: set[str] = set()
+        self.initialization_complete = self.initialization_mode == "none"
 
         offline_path = _config_get(config, "offline_values", None)
         require_offline = bool(_config_get(config, "require_offline_values", False))
@@ -74,10 +86,42 @@ class SPOTracker:
     def ensure(self, task_id: Any) -> str:
         task_id = self.canonical_task_id(task_id)
         if task_id not in self.alpha:
+            if self.strict_task_coverage and self.initialization_mode != "none":
+                raise RuntimeError(
+                    f"SPO task {task_id!r} has no initial-policy tracker values; "
+                    "canonical SPO requires init rollouts for every training task"
+                )
             self.alpha[task_id] = self.init_alpha
             self.beta[task_id] = self.init_beta
             self.sampled_count[task_id] = 0
         return task_id
+
+    def initialize_task(self, task_id: Any, raw_scores: Sequence[Any]) -> None:
+        """Initialize one task from canonical initial-policy rollout outcomes."""
+        task_id = self.canonical_task_id(task_id)
+        if not isinstance(raw_scores, Sequence) or isinstance(raw_scores, (str, bytes)):
+            raise ValueError(f"Initial SPO scores for {task_id!r} must be a list")
+
+        binary_scores = [int(float(score) > 0.0) for score in raw_scores]
+        if len(binary_scores) != self.offline_n:
+            raise ValueError(
+                f"Initial SPO task {task_id!r} has {len(binary_scores)} scores; "
+                f"expected exactly offline_n={self.offline_n}"
+            )
+
+        if self.offline_n == 0:
+            alpha, beta = self.init_alpha, self.init_beta
+        else:
+            successes = float(sum(binary_scores))
+            p_hat = (successes + 0.5) / (self.offline_n + 1.0)
+            n_init = 1.0 / (1.0 - self.rho_clip_lower)
+            alpha = n_init * p_hat
+            beta = n_init * (1.0 - p_hat)
+
+        self.alpha[task_id] = float(alpha)
+        self.beta[task_id] = float(beta)
+        self.sampled_count[task_id] = 0
+        self.initialized_task_ids.add(task_id)
 
     def load_offline_values(self, path: str) -> None:
         source = Path(path).expanduser()
@@ -86,7 +130,6 @@ class SPOTracker:
         if not isinstance(payload, Mapping):
             raise ValueError("SPO offline-values JSON must map task IDs to reward lists")
 
-        n_init = 1.0 / (1.0 - self.rho_clip_lower)
         for raw_task_id, raw_scores in payload.items():
             task_id = self.canonical_task_id(raw_task_id)
             if not isinstance(raw_scores, Sequence) or isinstance(raw_scores, (str, bytes)):
@@ -98,17 +141,12 @@ class SPOTracker:
                     f"offline_n={self.offline_n}"
                 )
             if self.offline_n == 0:
-                alpha, beta = self.init_alpha, self.init_beta
+                selected_scores = []
+            elif len(binary_scores) > self.offline_n:
+                selected_scores = self._rng.sample(binary_scores, self.offline_n)
             else:
-                if len(binary_scores) > self.offline_n:
-                    binary_scores = self._rng.sample(binary_scores, self.offline_n)
-                successes = float(sum(binary_scores))
-                p_hat = (successes + 0.5) / (self.offline_n + 1.0)
-                alpha = n_init * p_hat
-                beta = n_init * (1.0 - p_hat)
-            self.alpha[task_id] = float(alpha)
-            self.beta[task_id] = float(beta)
-            self.sampled_count[task_id] = 0
+                selected_scores = binary_scores
+            self.initialize_task(task_id, selected_scores)
 
     def value(self, task_id: Any) -> float:
         task_id = self.ensure(task_id)
@@ -146,6 +184,8 @@ class SPOTracker:
             "alpha": dict(self.alpha),
             "beta": dict(self.beta),
             "sampled_count": dict(self.sampled_count),
+            "initialized_task_ids": sorted(self.initialized_task_ids),
+            "initialization_complete": bool(self.initialization_complete),
             "rng_state": self._rng.getstate(),
         }
 
@@ -161,6 +201,26 @@ class SPOTracker:
         self.sampled_count = {
             task_id: int(state.get("sampled_count", {}).get(task_id, 0)) for task_id in alpha
         }
+        self.initialized_task_ids = {
+            self.canonical_task_id(task_id)
+            for task_id in state.get("initialized_task_ids", alpha.keys())
+        }
+        if (
+            "initialization_complete" not in state
+            and self.strict_task_coverage
+            and self.initialization_mode != "none"
+        ):
+            raise ValueError(
+                "SPO checkpoint predates canonical init-8 metadata and cannot be "
+                "resumed as an initialized main run"
+            )
+        if "initialization_complete" in state:
+            self.initialization_complete = bool(state["initialization_complete"])
+        else:
+            # A legacy, non-strict checkpoint may continue with its existing
+            # tracker values; unseen tasks retain the configured Beta fallback.
+            # Never recollect with a policy that has already been updated.
+            self.initialization_complete = bool(alpha) or self.initialization_mode == "none"
         if "rng_state" in state:
             self._rng.setstate(state["rng_state"])
 

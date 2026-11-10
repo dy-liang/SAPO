@@ -8,12 +8,21 @@ num_cpus_per_env_worker=${NUM_CPUS_PER_ENV_WORKER:-0.02}
 train_data_size=${TRAIN_DATA_SIZE:-128}
 val_data_size=${VAL_DATA_SIZE:-128}
 spo_offline_values=${SPO_OFFLINE_VALUES:-null}
-spo_require_offline_values=${SPO_REQUIRE_OFFLINE_VALUES:-False}
+if [[ -n "${SPO_INIT_MODE:-}" ]]; then
+    spo_init_mode=$SPO_INIT_MODE
+elif [[ "$spo_offline_values" == "null" ]]; then
+    spo_init_mode=collect
+else
+    spo_init_mode=offline
+fi
+spo_init_rollouts=${SPO_INIT_ROLLOUTS:-8}
+spo_init_cache=${SPO_INIT_CACHE:-null}
+spo_strict_task_coverage=${SPO_STRICT_TASK_COVERAGE:-False}
 spo_rho_type=${SPO_RHO_TYPE:-kl}
-if [[ "$spo_offline_values" == "null" ]]; then
+if [[ "$spo_init_mode" == "none" ]]; then
     default_experiment_name=qwen2.5_7b_SPO_uniform_no_init
 else
-    default_experiment_name=qwen2.5_7b_SPO_uniform
+    default_experiment_name=qwen2.5_7b_SPO_uniform_init8
 fi
 experiment_name=${EXPERIMENT_NAME:-$default_experiment_name}
 
@@ -22,16 +31,20 @@ python3 -m examples.data_preprocess.prepare \
     --train_data_size "$train_data_size" \
     --val_data_size "$val_data_size"
 
-# ALFWorld's bundled vector environment samples gamefiles internally, so this
-# configuration is SPO-uniform. It still uses canonical SPO Beta advantages and
-# KL-adaptive forgetting; enable=False prevents a misleading priority claim.
+# Init-8 explicitly pins each gamefile; subsequent ALFWorld training samples
+# gamefiles internally and is therefore SPO-uniform. enable=False prevents a
+# misleading online task-priority claim.
 python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=spo \
     algorithm.use_kl_in_reward=False \
     algorithm.spo.enable=True \
     algorithm.spo.offline_values="$spo_offline_values" \
     algorithm.spo.offline_n=8 \
-    algorithm.spo.require_offline_values="$spo_require_offline_values" \
+    algorithm.spo.require_offline_values=False \
+    algorithm.spo.initialization.mode="$spo_init_mode" \
+    algorithm.spo.initialization.rollouts_per_task="$spo_init_rollouts" \
+    algorithm.spo.initialization.cache_path="$spo_init_cache" \
+    algorithm.spo.initialization.strict_task_coverage="$spo_strict_task_coverage" \
     algorithm.spo.rho.type="$spo_rho_type" \
     algorithm.spo.rho.value=0.875 \
     algorithm.spo.rho.clip_lower=0.875 \
@@ -84,7 +97,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.ref.fsdp_config.param_offload=False \
     actor_rollout_ref.novelty_module.enable=False \
     env.env_name=alfworld/AlfredTWEnv \
-    env.seed=0 \
+    env.seed=3 \
     env.max_steps=50 \
     env.rollout.n=1 \
     env.resources_per_worker.num_cpus="$num_cpus_per_env_worker" \

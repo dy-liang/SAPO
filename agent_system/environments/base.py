@@ -54,6 +54,33 @@ class EnvironmentManagerBase:
             )
         setter(task_weights=task_weights, default_weight=default_weight)
 
+    def get_all_train_task_ids(self) -> List[str]:
+        """Return stable IDs for every task reachable by the training environment."""
+        getter = getattr(self.envs, "get_all_train_task_ids", None)
+        if getter is None:
+            raise NotImplementedError(
+                f"{type(self.envs).__name__} cannot enumerate training tasks"
+            )
+        return [str(task_id) for task_id in getter()]
+
+    def set_forced_task_ids(self, task_ids: List[str]) -> None:
+        """Force the next resets to use an explicit task on every env worker."""
+        setter = getattr(self.envs, "set_forced_task_ids", None)
+        if setter is None:
+            raise NotImplementedError(
+                f"{type(self.envs).__name__} cannot reset to explicit tasks"
+            )
+        setter(task_ids)
+
+    def clear_forced_task_ids(self) -> None:
+        """Restore the environment's normal task-selection behavior."""
+        clearer = getattr(self.envs, "clear_forced_task_ids", None)
+        if clearer is None:
+            raise NotImplementedError(
+                f"{type(self.envs).__name__} cannot clear explicit task resets"
+            )
+        clearer()
+
     def reset(self, kwargs) -> Dict[str, Any]:
         """
         Reset all environments and return the initial observations.

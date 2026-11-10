@@ -59,8 +59,30 @@ class AlfworldWorker:
     """
     
     def __init__(self, config, seed, base_env):
+        self.seed_value = seed
+        self.base_env = base_env
         self.env = base_env.init_env(batch_size=1)  # Each worker holds only one sub-environment
         self.env.seed(seed)
+
+    def _replace_env(self, game_files=None):
+        close = getattr(self.env, "close", None)
+        if close is not None:
+            close()
+        try:
+            self.env = self.base_env.init_env(batch_size=1, game_files=game_files)
+        except TypeError as exc:
+            raise NotImplementedError(
+                "Canonical SPO task-targeted initialization currently requires AlfredTWEnv"
+            ) from exc
+        self.env.seed(self.seed_value)
+
+    def assign_task(self, gamefile):
+        """Pin this worker to one ALFWorld game for repeated init rollouts."""
+        self._replace_env(game_files=[str(gamefile)])
+
+    def clear_assigned_task(self):
+        """Restore the full training-game environment after SPO initialization."""
+        self._replace_env(game_files=None)
     
     def step(self, action):
         """Execute a step in the environment"""
@@ -94,6 +116,8 @@ class AlfworldEnvs(gym.Env):
         config = load_config_file(alf_config_path)
         env_type = config['env']['type']
         base_env = get_environment(env_type)(config, train_eval='train' if is_train else eval_dataset)
+        self.base_env = base_env
+        self.is_train = is_train
         self.multi_modal = (env_type == 'AlfredThorEnv')
         self.num_processes = env_num * group_n
         self.group_n = group_n
@@ -106,6 +130,28 @@ class AlfworldEnvs(gym.Env):
             self.workers.append(worker)
 
         self.prev_admissible_commands = [None for _ in range(self.num_processes)]
+
+    def get_all_train_task_ids(self):
+        if not self.is_train:
+            raise ValueError("Only the ALFWorld training environment exposes train task IDs")
+        game_files = getattr(self.base_env, "game_files", None)
+        if game_files is None:
+            raise NotImplementedError(
+                "Canonical SPO task enumeration currently requires AlfredTWEnv"
+            )
+        return list(game_files)
+
+    def set_forced_task_ids(self, task_ids):
+        if len(task_ids) != self.num_processes:
+            raise ValueError(
+                f"Expected {self.num_processes} forced ALFWorld tasks, got {len(task_ids)}"
+            )
+        ray.get(
+            [worker.assign_task.remote(task_id) for worker, task_id in zip(self.workers, task_ids)]
+        )
+
+    def clear_forced_task_ids(self):
+        ray.get([worker.clear_assigned_task.remote() for worker in self.workers])
 
     def step(self, actions):
         assert len(actions) == self.num_processes, \
