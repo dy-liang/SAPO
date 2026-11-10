@@ -131,9 +131,33 @@ class SearchEnvironmentManager(EnvironmentManagerBase):
             
 
 class AlfWorldEnvironmentManager(EnvironmentManagerBase):
+    SPO_TASK_TYPES = (
+        "pick_and_place",
+        "pick_two_obj_and_place",
+        "look_at_obj_in_light",
+        "pick_heat_then_place_in_recep",
+        "pick_cool_then_place_in_recep",
+        "pick_clean_then_place_in_recep",
+    )
+
     def __init__(self, envs, projection_f, config):
         self.memory = SimpleMemory()
         super().__init__(envs, projection_f, config)
+
+    def spo_task_id(self, raw_task_id: Any) -> str:
+        granularity = str(
+            self.config.algorithm.spo.get("task_granularity", "instance")
+        )
+        if granularity == "instance":
+            return super().spo_task_id(raw_task_id)
+        if granularity != "alfworld_type":
+            raise ValueError(f"Unsupported ALFWorld SPO task granularity: {granularity}")
+
+        gamefile = str(raw_task_id).strip()
+        for task_type in self.SPO_TASK_TYPES:
+            if task_type in gamefile:
+                return task_type
+        raise ValueError(f"Cannot infer ALFWorld task type from gamefile: {gamefile!r}")
     
     def reset(self, kwargs):
         text_obs, image_obs, infos = self.envs.reset()
@@ -227,16 +251,7 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
                 return  # Exit after finding the first active mask
 
     def _process_gamefile(self, gamefile, won_value, success):
-        tasks = [
-            "pick_and_place",
-            "pick_two_obj_and_place",
-            "look_at_obj_in_light",
-            "pick_heat_then_place_in_recep",
-            "pick_cool_then_place_in_recep",
-            "pick_clean_then_place_in_recep",
-        ]
-        
-        for task in tasks:
+        for task in self.SPO_TASK_TYPES:
             if task in gamefile:
                 success[f"{task}_success_rate"].append(won_value)
                 break

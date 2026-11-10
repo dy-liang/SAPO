@@ -328,7 +328,7 @@ class TrajectoryCollector:
                     raise ValueError(
                         "SPO requires a stable task ID in info['task_id'] or info['extra.gamefile']"
                     )
-                spo_task_ids.append(str(task_id).strip())
+                spo_task_ids.append(envs.spo_task_id(task_id))
             spo_task_ids = np.asarray(spo_task_ids, dtype=object)
 
         lenght_obs = len(obs['text']) if obs['text'] is not None else len(obs['image'])

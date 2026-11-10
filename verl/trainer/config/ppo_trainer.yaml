@@ -285,6 +285,9 @@ algorithm:
   # rollout outcomes, matching the official SPO recipe.
   spo:
     enable: False
+    # "instance" keeps one tracker per environment task. ALFWorld may use
+    # "alfworld_type" to share six trackers across its official task types.
+    task_granularity: instance
     initialization:
       # Canonical SPO initializes every training task with eight rollouts from
       # the frozen initial policy before the first optimizer step.  Set mode

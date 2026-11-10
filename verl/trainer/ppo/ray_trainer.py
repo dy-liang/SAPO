@@ -20,6 +20,7 @@ This trainer supports model-agonistic model initialization with huggingface
 
 import json
 import os
+import random
 import uuid
 from collections import OrderedDict, defaultdict
 from contextlib import contextmanager
@@ -897,6 +898,11 @@ class RayPPOTrainer:
             assert float(rho.d_half) > 0.0
             assert int(rho.max_policy_memory_tasks) >= 0
             initialization = spo.initialization
+            assert str(spo.task_granularity) in {"instance", "alfworld_type"}
+            if str(spo.task_granularity) == "alfworld_type":
+                assert "alfworld" in str(config.env.env_name).lower(), (
+                    "alfworld_type granularity is only valid for ALFWorld"
+                )
             assert str(initialization.mode) in {"collect", "offline", "none"}
             assert int(initialization.rollouts_per_task) >= 0
             if str(initialization.mode) != "none":
@@ -1568,8 +1574,12 @@ class RayPPOTrainer:
         configured = self.config.algorithm.spo.initialization.get("cache_path", None)
         if configured not in (None, "", "null", "None"):
             return os.path.abspath(os.path.expanduser(str(configured)))
+        granularity = str(self.config.algorithm.spo.task_granularity)
         return os.path.abspath(
-            os.path.join(self.config.trainer.default_local_dir, "spo_initial_values.json")
+            os.path.join(
+                self.config.trainer.default_local_dir,
+                f"spo_initial_values_{granularity}.json",
+            )
         )
 
     def _validate_spo_initialization_coverage(self, task_ids) -> None:
@@ -1616,9 +1626,13 @@ class RayPPOTrainer:
         """Run canonical initial-policy rollouts before the first actor update."""
         initialization = self.config.algorithm.spo.initialization
         mode = str(initialization.mode)
-        task_ids = list(dict.fromkeys(self.envs.get_all_train_task_ids()))
-        if not task_ids:
+        raw_task_ids = list(dict.fromkeys(self.envs.get_all_train_task_ids()))
+        if not raw_task_ids:
             raise RuntimeError("SPO initialization found no training tasks")
+        task_groups = defaultdict(list)
+        for raw_task_id in raw_task_ids:
+            task_groups[self.envs.spo_task_id(raw_task_id)].append(raw_task_id)
+        task_ids = list(task_groups)
 
         if mode == "none":
             self.spo_tracker.initialization_complete = True
@@ -1651,39 +1665,67 @@ class RayPPOTrainer:
             )
 
         initial_values = {str(task_id): [] for task_id in task_ids}
+        granularity = str(self.config.algorithm.spo.task_granularity)
+        scheduled_task_batches = []
+        if granularity == "alfworld_type":
+            rng = random.Random(int(self.config.algorithm.spo.seed))
+            initialization_tasks = []
+            for task_id in sorted(task_groups):
+                candidates = sorted(task_groups[task_id])
+                if len(candidates) >= num_rollouts:
+                    selected = rng.sample(candidates, num_rollouts)
+                else:
+                    selected = list(candidates)
+                    print(
+                        f"Warning: ALFWorld type {task_id!r} has only "
+                        f"{len(candidates)} gamefiles for init-{num_rollouts}"
+                    )
+                initialization_tasks.extend(selected)
+            scheduled_task_batches = [
+                initialization_tasks[start : start + batch_size]
+                for start in range(0, len(initialization_tasks), batch_size)
+            ]
+        else:
+            for start in range(0, len(raw_task_ids), batch_size):
+                task_batch = raw_task_ids[start : start + batch_size]
+                scheduled_task_batches.extend(
+                    [list(task_batch) for _ in range(num_rollouts)]
+                )
+
         print(
-            f"Collecting {num_rollouts} initial-policy rollouts for "
-            f"{len(task_ids)} SPO tasks before training"
+            f"Collecting init-{num_rollouts} for {len(task_ids)} SPO trackers "
+            f"at granularity={granularity!r} in "
+            f"{len(scheduled_task_batches)} rollout batches"
         )
 
         try:
-            for start in tqdm(
-                range(0, len(task_ids), batch_size),
-                desc="SPO init-8 task batches",
+            for task_batch in tqdm(
+                scheduled_task_batches,
+                desc=f"SPO init-{num_rollouts} rollout batches",
             ):
-                task_batch = task_ids[start : start + batch_size]
                 forced_tasks = list(task_batch)
                 while len(forced_tasks) < batch_size:
-                    forced_tasks.append(task_ids[len(forced_tasks) % len(task_ids)])
+                    forced_tasks.append(
+                        raw_task_ids[len(forced_tasks) % len(raw_task_ids)]
+                    )
                 self.envs.set_forced_task_ids(forced_tasks)
 
-                for _ in range(num_rollouts):
-                    rollout = self.traj_collector.multi_turn_loop(
-                        gen_batch=deepcopy(gen_batch),
-                        actor_rollout_wg=self.actor_rollout_wg,
-                        envs=self.envs,
-                        is_train=True,
-                    )
-                    record_tasks, _, record_rewards, _ = extract_trajectory_records(
-                        rollout.non_tensor_batch["spo_task_id"],
-                        rollout.non_tensor_batch["traj_uid"],
-                        rollout.batch["spo_binary_reward"].detach().cpu().tolist(),
-                    )
-                    for task_id, reward in zip(record_tasks, record_rewards):
-                        values = initial_values.get(task_id)
-                        if values is not None and len(values) < num_rollouts:
-                            values.append(float(reward))
-                    del rollout
+                rollout = self.traj_collector.multi_turn_loop(
+                    gen_batch=deepcopy(gen_batch),
+                    actor_rollout_wg=self.actor_rollout_wg,
+                    envs=self.envs,
+                    is_train=True,
+                )
+                record_tasks, _, record_rewards, _ = extract_trajectory_records(
+                    rollout.non_tensor_batch["spo_task_id"],
+                    rollout.non_tensor_batch["traj_uid"],
+                    rollout.batch["spo_binary_reward"].detach().cpu().tolist(),
+                )
+                for task_id, reward in zip(record_tasks, record_rewards):
+                    values = initial_values.get(task_id)
+                    if values is not None and len(values) < num_rollouts:
+                        values.append(float(reward))
+                del rollout
         finally:
             self.envs.clear_forced_task_ids()
 

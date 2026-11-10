@@ -18,6 +18,7 @@ fi
 spo_init_rollouts=${SPO_INIT_ROLLOUTS:-8}
 spo_init_cache=${SPO_INIT_CACHE:-null}
 spo_strict_task_coverage=${SPO_STRICT_TASK_COVERAGE:-False}
+spo_task_granularity=${SPO_TASK_GRANULARITY:-instance}
 spo_rho_type=${SPO_RHO_TYPE:-kl}
 spo_task_sampling=${SPO_TASK_SAMPLING:-False}
 if [[ "$spo_init_mode" == "none" ]]; then
@@ -38,6 +39,7 @@ python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=spo \
     algorithm.use_kl_in_reward=False \
     algorithm.spo.enable=True \
+    algorithm.spo.task_granularity="$spo_task_granularity" \
     algorithm.spo.offline_values="$spo_offline_values" \
     algorithm.spo.offline_n=8 \
     algorithm.spo.require_offline_values=False \

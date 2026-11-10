@@ -63,6 +63,20 @@ class EnvironmentManagerBase:
             )
         return [str(task_id) for task_id in getter()]
 
+    def spo_task_id(self, raw_task_id: Any) -> str:
+        """Map an environment instance ID to the tracker key used by SPO."""
+        granularity = str(
+            self.config.algorithm.spo.get("task_granularity", "instance")
+        )
+        if granularity != "instance":
+            raise NotImplementedError(
+                f"{type(self).__name__} does not support SPO granularity {granularity!r}"
+            )
+        task_id = str(raw_task_id).strip()
+        if not task_id:
+            raise ValueError("SPO received an empty environment task ID")
+        return task_id
+
     def set_forced_task_ids(self, task_ids: List[str]) -> None:
         """Force the next resets to use an explicit task on every env worker."""
         setter = getattr(self.envs, "set_forced_task_ids", None)
