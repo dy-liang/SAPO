@@ -8,7 +8,7 @@ num_cpus_per_env_worker=0.05 # The CPU resource allocated for each environment w
 train_data_size=16
 val_data_size=128
 group_size=8
-mode="mean_std_norm" # "mean_norm" or "mean_std_norm" bash examples/gigpo_trainer/run_alfworld.sh
+mode="mean_std_norm" # "mean_norm" or "mean_std_norm"
 
 python3 -m examples.data_preprocess.prepare \
     --mode 'text' \
@@ -72,6 +72,3 @@ python3 -m verl.trainer.main_ppo \
     trainer.test_freq=5 \
     trainer.total_epochs=150 \
     trainer.val_before_train=True $@
-
-# bash ./gpu.sh
-# echo "GPU holds"

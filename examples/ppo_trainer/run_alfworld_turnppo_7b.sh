@@ -1,21 +1,12 @@
 #!/usr/bin/env bash
-pid=3743554
-echo "进程 $pid 运行中..."
-while kill -0 "$pid" 2>/dev/null; do
-    sleep 5
-done
-echo "进程 $pid 已结束"
-pkill -f "keepgpu"
-
 set -x
 ENGINE=${1:-vllm}
 export VLLM_ATTENTION_BACKEND=XFORMERS
 
-export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
+#export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
 export HF_ENDPOINT=${HF_ENDPOINT:-https://hf-mirror.com}
-num_cpus_per_env_worker=0.05 # The CPU resource allocated for each environment worker. If you want to use less CPU resources, you can decrease this value.
+num_cpus_per_env_worker=0.02 
 
-# nohup bash examples/ppo_trainer/run_alfworld_turn_gae.sh > ./log/ALF_run_alfworld_turn_gae_PPO_gamlam9595_Ap1_s0.log 2>&1 &
 train_data_size=128 # match GRPO and GiGPO configuration (16 × 8)
 val_data_size=128
 
@@ -39,7 +30,7 @@ python3 -m verl.trainer.main_ppo \
     data.filter_overlong_prompts=True \
     data.truncation='error' \
     data.return_raw_chat=True \
-    actor_rollout_ref.model.path=$HOME/.cache/modelscope/hub/models/Qwen/Qwen2.5-1.5B-Instruct \
+    actor_rollout_ref.model.path=$HOME/.cache/modelscope/hub/models/Qwen/Qwen2.5-7B-Instruct \
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.model.use_remove_padding=True \
     actor_rollout_ref.actor.ppo_mini_batch_size=256 \
@@ -53,7 +44,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=32 \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
     actor_rollout_ref.rollout.name=$ENGINE \
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.6 \
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.4 \
     actor_rollout_ref.rollout.enable_chunked_prefill=False \
     actor_rollout_ref.rollout.enforce_eager=False \
     actor_rollout_ref.rollout.free_cache_engine=False \
@@ -62,24 +53,24 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=32 \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
     actor_rollout_ref.actor.use_invalid_action_penalty=True \
-    actor_rollout_ref.actor.invalid_action_penalty_coef=1 \
+    actor_rollout_ref.actor.invalid_action_penalty_coef=0.1 \
     critic.optim.lr=1e-6 \
     critic.model.use_remove_padding=True \
-    critic.model.path=$HOME/.cache/modelscope/hub/models/Qwen/Qwen2.5-1.5B-Instruct \
+    critic.model.path=$HOME/.cache/modelscope/hub/models/Qwen/Qwen2.5-7B-Instruct \
     critic.model.enable_gradient_checkpointing=True \
     critic.ppo_micro_batch_size_per_gpu=16 \
     critic.model.fsdp_config.param_offload=False \
     critic.model.fsdp_config.optimizer_offload=False \
     algorithm.use_kl_in_reward=False \
     env.env_name=alfworld/AlfredTWEnv \
-    env.seed=3 \
+    env.seed=0 \
     env.max_steps=50 \
     env.resources_per_worker.num_cpus=$num_cpus_per_env_worker \
     trainer.critic_warmup=0 \
     trainer.logger=['console','wandb'] \
     trainer.project_name='verl_agent_alfworld' \
-    trainer.experiment_name='ppo_turn_gae_qwen2.5_1.5b_s3_gamlam9595_Ap1' \
-    trainer.n_gpus_per_node=1 \
+    trainer.experiment_name='ppo_turn_qwen2.5_7b_s0' \
+    trainer.n_gpus_per_node=2 \
     trainer.nnodes=1 \
     trainer.save_freq=150 \
     trainer.test_freq=5 \

@@ -1,18 +1,15 @@
 set -x
 ENGINE=${1:-vllm}
 export VLLM_ATTENTION_BACKEND=XFORMERS
-export CUDA_VISIBLE_DEVICES=0,1 #ps -ef | grep "+logits_swtich" | grep -v grep
+export CUDA_VISIBLE_DEVICES=0,1
 export HYDRA_FULL_ERROR=1
-num_cpus_per_env_worker=0.05 # The CPU resource allocated for each environment worker. If you want to use less CPU resources, you can decrease this value.
+num_cpus_per_env_worker=0.05 
 export HF_ENDPOINT=https://hf-mirror.com
 train_data_size=16
 val_data_size=128
 group_size=8
 
 # We only use data preparation to indicate the modality and the data size. pkill -f "_mask"
-# nohup bash examples/grpo_trainer/run_alfworld_7b.sh > ./log/test_grpo_200_128_7b_s3_1_S10T10_mean_step1001.log 2>&1 &
-# nohup bash examples/grpo_trainer/run_alfworld.sh > ./log/test_grpo_200_128_1.5b_s0_1_S10T10_mean_step1001.log 2>&1 &
-# nohup bash examples/grpo_trainer/run_alfworld.sh > ./log/test_grpo_200_128_1.5b_s3_3_S10T10_mean_decay0.log 2>&1 &
 python3 -m examples.data_preprocess.prepare \
     --mode 'text' \
     --train_data_size $train_data_size \
@@ -70,5 +67,3 @@ python3 -m verl.trainer.main_ppo \
     trainer.test_freq=5 \
     trainer.total_epochs=150 \
     trainer.val_before_train=True $@
-
-#sh /home/hly/projects/llm-agent/verl-agent/gpu.sh  grpo_200_qwen2.5_1.5b_s0_2_credit_v2_pos5-0.2
