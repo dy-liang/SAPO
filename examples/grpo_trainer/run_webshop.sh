@@ -1,24 +1,19 @@
 set -x
 ENGINE=${1:-vllm}
 export VLLM_ATTENTION_BACKEND=XFORMERS
-export CUDA_VISIBLE_DEVICES=0,1,2,3 #ps -ef | grep "+logits_swtich" | grep -v grep
-
-pkill -f "keepgpu"
-ray stop -f
-ray start --head --include-dashboard=false
+export CUDA_VISIBLE_DEVICES=0,1,2,3
 export HF_ENDPOINT=https://hf-mirror.com
 
-num_cpus_per_env_worker=0.1 # The CPU resource allocated for each environment worker. If you want to use less CPU resources, you can decrease this value.
-#unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY
+num_cpus_per_env_worker=0.1
 train_data_size=8
-val_data_size=2
+val_data_size=128
 group_size=8
-# nohup bash examples/qapo_trainer/run_webshop.sh > ./log/test_qapo_128_1.5b_s0_1_w0-1-02_woAP_S10T10.log 2>&1 &
+
 # We only use data preparation to indicate the modality and the data size.
-# python3 -m examples.data_preprocess.prepare \
-#     --mode 'text' \
-#     --train_data_size $train_data_size \
-#     --val_data_size $val_data_size
+python3 -m examples.data_preprocess.prepare \
+    --mode 'text' \
+    --train_data_size $train_data_size \
+    --val_data_size $val_data_size
 
 python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=grpo \
@@ -31,7 +26,7 @@ python3 -m verl.trainer.main_ppo \
     data.filter_overlong_prompts=True \
     data.truncation='error' \
     data.return_raw_chat=True \
-    actor_rollout_ref.model.path=/home/heliyuan/.cache/modelscope/hub/models/Qwen/Qwen2.5-1.5B-Instruct \
+    actor_rollout_ref.model.path=Qwen/Qwen2.5-1.5B-Instruct \
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.model.use_remove_padding=True \
     actor_rollout_ref.actor.ppo_mini_batch_size=64 \
@@ -71,6 +66,3 @@ python3 -m verl.trainer.main_ppo \
     trainer.test_freq=-1 \
     trainer.total_epochs=150 \
     trainer.val_before_train=False $@
-
-cd /home/heliyuan/project_code/QAPO
-sh keepgpu.sh
