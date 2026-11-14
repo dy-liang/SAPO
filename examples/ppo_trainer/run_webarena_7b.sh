@@ -48,8 +48,9 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.name="$ENGINE" \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
     actor_rollout_ref.rollout.response_length=512 \
-    actor_rollout_ref.rollout.max_num_batched_tokens=32768 \
+    actor_rollout_ref.rollout.max_num_batched_tokens=8192 \
     actor_rollout_ref.rollout.max_model_len=32768 \
+    +actor_rollout_ref.rollout.allow_max_num_batched_tokens_below_max_model_len=True \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.7 \
     actor_rollout_ref.rollout.enable_chunked_prefill=True \
     actor_rollout_ref.rollout.free_cache_engine=False \
