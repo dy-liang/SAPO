@@ -11,6 +11,7 @@ MODEL_PATH=${MODEL_PATH:-Qwen/Qwen2.5-7B-Instruct}
 TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE:-16}
 VAL_BATCH_SIZE=${VAL_BATCH_SIZE:-4}
 GROUP_SIZE=${GROUP_SIZE:-8}
+TOTAL_TRAINING_STEPS=${TOTAL_TRAINING_STEPS:-160} # match ppo/sapo step
 N_GPUS=${N_GPUS:-2}
 
 python3 -m examples.data_preprocess.prepare_agentgym \
@@ -72,5 +73,6 @@ python3 -m verl.trainer.main_ppo \
     trainer.save_freq=25 \
     trainer.test_freq=5 \
     trainer.total_epochs=10 \
+    trainer.total_training_steps="$TOTAL_TRAINING_STEPS" \
     trainer.val_before_train=True \
     "${@:2}"
