@@ -31,7 +31,7 @@
 |:--|:--|
 | **Optimization** | ✅ PPO-style policy optimization with explicit value learning<br> ✅ No separate critic model or value head<br>✅ No same-task rollout groups required <br>✅ Turn-level generalized advantage estimation<br>✅ Auxiliary on-policy SARSA action-value targets |
 | **Stability** | ✅ Value-target scaling<br>✅ Advantage normalization<br>✅ Double logits-based Value |
-| **Environment Stack** | ✅ ALFWorld <br>✅ WebShop<br>🧪 Others in testing|
+| **Environment Stack** | ✅ ALFWorld <br>✅ WebShop<br>✅ SciWorld<br>✅ WebArena<br>🧪 Others in testing|
 | **Evaluated Backbones** | ✅ Qwen2.5-1.5B-Instruct<br>✅ Qwen2.5-7B-Instruct<br>✅ Qwen3-14B-Instruct<br>✅ Qwen3-A3B-32B (MoE)<br>🧪 Others in testing |
 | **Measured Efficiency** | ✅ Consistent performance than PPO <br>✅ 24.8% lower average peak GPU memory than PPO<br>✅ 23.1% lower average per-iteration runtime than PPO |
 
@@ -220,6 +220,14 @@ appworld download data
 
 > AppWorld is supported by the underlying `verl-agent` environment stack, but it is not part of the SAPO experiments reported above.
 
+### 5. AgentGym SciWorld and WebArena
+
+SciWorld and WebArena run as standalone AgentGym HTTP services in isolated
+Conda environments. Their installation includes the official task-ID data,
+server startup, connectivity checks, training commands, evaluation behavior,
+and troubleshooting notes. See the complete
+[SciWorld/WebArena setup and training guide](agent_system/environments/README.md#6-agentgym-sciworld-and-webarena).
+
 ## Examples
 
 The launch scripts follow the `verl-agent` convention. Update model paths, GPU allocation, and environment-specific data paths in the corresponding shell script before launching a run.
@@ -231,6 +239,8 @@ SAPO uses one rollout per task and learns policy and value in a shared model upd
 ```bash
 bash examples/sapo_trainer/run_alfworld.sh  # ALFWorld
 bash examples/sapo_trainer/run_webshop.sh   # WebShop
+bash examples/sapo_trainer/run_sciworld_7b.sh vllm  # SciWorld 7B
+bash examples/sapo_trainer/run_webarena_7b.sh vllm  # WebArena 7B
 ```
 
 ### PPO
@@ -240,6 +250,17 @@ The PPO baseline uses a separate critic and the same turn-level GAE and matched 
 ```bash
 bash examples/ppo_trainer/run_alfworld.sh  # ALFWorld
 bash examples/ppo_trainer/run_webshop.sh   # WebShop
+bash examples/ppo_trainer/run_sciworld_7b.sh vllm  # SciWorld 7B
+bash examples/ppo_trainer/run_webarena_7b.sh vllm  # WebArena 7B
+```
+
+### GRPO
+
+The AgentGym GRPO scripts use grouped rollouts of the same task ID:
+
+```bash
+bash examples/grpo_trainer/run_sciworld_7b.sh vllm  # SciWorld 7B
+bash examples/grpo_trainer/run_webarena_7b.sh vllm  # WebArena 7B
 ```
 
 ### Implementation Flow

@@ -62,6 +62,12 @@ class TrajectoryCollector:
         raw_prompt = gen_batch.non_tensor_batch['raw_prompt'][item]
         data_source = gen_batch.non_tensor_batch['data_source'][item]
         apply_chat_template_kwargs = self.config.data.get("apply_chat_template_kwargs", {})
+        custom_prompt_limit = obs.get("max_prompt_length", None)
+        observation_max_prompt_length = (
+            self.config.data.max_prompt_length
+            if custom_prompt_limit is None
+            else int(custom_prompt_limit)
+        )
         
         # Get observation components
         obs_texts = obs.get('text', None)
@@ -131,7 +137,7 @@ class TrajectoryCollector:
         
         input_ids, attention_mask = verl_F.tokenize_and_postprocess_data(prompt=prompt_with_chat_template,
                                                                             tokenizer=self.tokenizer,
-                                                                            max_length=self.config.data.max_prompt_length,
+                                                                            max_length=observation_max_prompt_length,
                                                                             pad_token_id=self.tokenizer.pad_token_id,
                                                                             left_pad=True,
                                                                             truncation=self.config.data.truncation,)
@@ -159,17 +165,25 @@ class TrajectoryCollector:
             position_ids = compute_position_id_with_mask(attention_mask)
 
         raw_prompt_ids = self.tokenizer.encode(raw_prompt, add_special_tokens=False)
-        if len(raw_prompt_ids) > self.config.data.max_prompt_length:
+        if len(raw_prompt_ids) > observation_max_prompt_length:
             if self.config.data.truncation == "left":
-                raw_prompt_ids = raw_prompt_ids[-self.config.data.max_prompt_length :]
+                raw_prompt_ids = raw_prompt_ids[-observation_max_prompt_length:]
             elif self.config.data.truncation == "right":
-                raw_prompt_ids = raw_prompt_ids[: self.config.data.max_prompt_length]
+                raw_prompt_ids = raw_prompt_ids[:observation_max_prompt_length]
             elif self.config.data.truncation == "middle":
-                left_half = self.config.data.max_prompt_length // 2
-                right_half = self.config.data.max_prompt_length - left_half
+                left_half = observation_max_prompt_length // 2
+                right_half = observation_max_prompt_length - left_half
                 raw_prompt_ids = raw_prompt_ids[:left_half] + raw_prompt_ids[-right_half:]
             elif self.config.data.truncation == "error":
-                raise RuntimeError(f"Prompt length {len(raw_prompt_ids)} is longer than {self.config.data.max_prompt_length}.")
+                if custom_prompt_limit is None:
+                    raise RuntimeError(
+                        f"Prompt length {len(raw_prompt_ids)} is longer than "
+                        f"{self.config.data.max_prompt_length}."
+                    )
+                raise RuntimeError(
+                    f"Prompt length {len(raw_prompt_ids)} is longer than "
+                    f"environment observation limit {observation_max_prompt_length}."
+                )
 
         # Build final output dict
         row_dict.update({

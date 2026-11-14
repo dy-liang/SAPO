@@ -400,3 +400,16 @@ env:
   webshop:
     use_small: True
     human_goals: False
+  agentgym:
+    # Base URL of a separately launched AgentGym SciWorld or WebArena server.
+    env_addr: "http://127.0.0.1:36005"
+    timeout: 600
+    max_retries: 3
+    # Multiplies training rewards only; raw task_score metrics remain unchanged.
+    reward_scale: 1.0
+    # Only SciWorld/WebArena use this separate per-turn observation cap.
+    observation_max_prompt_length: null
+    # Normally task IDs come from env_kwargs in prepare_agentgym.py output.
+    # These optional lists are only a fallback for custom datasets.
+    train_task_ids: []
+    val_task_ids: []

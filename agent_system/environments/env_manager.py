@@ -20,6 +20,13 @@ import numpy as np
 from functools import partial
 import os
 from agent_system.environments.prompts import *
+from agent_system.environments.prompts.agentgym import (
+    SCIWORLD_ACTIONS,
+    SCIWORLD_TEMPLATE,
+    SCIWORLD_TEMPLATE_NO_HIS,
+    WEBARENA_ACTION_FORMAT,
+    WEBARENA_TEMPLATE,
+)
 from agent_system.environments.base import EnvironmentManagerBase, to_numpy
 from agent_system.memory import SimpleMemory, SearchMemory
 from omegaconf import OmegaConf
@@ -599,6 +606,106 @@ class AppWorldEnvironmentManager(EnvironmentManagerBase):
                 postprocess_text_obs.append(obs)
         return postprocess_text_obs
 
+
+class AgentGymEnvironmentManager(EnvironmentManagerBase):
+    """Adapter for AgentGym's remote SciWorld and WebArena services."""
+
+    def __init__(self, envs, projection_f, config, task_name: str):
+        self.task_name = task_name.lower()
+        self.memory = SimpleMemory()
+        self.pre_text_obs = None
+        prompt_limit = config.env.agentgym.get("observation_max_prompt_length", None)
+        if prompt_limit is None:
+            prompt_limit = config.data.max_prompt_length
+        self.observation_max_prompt_length = int(prompt_limit)
+        super().__init__(envs, projection_f, config)
+
+    def reset(self, kwargs):
+        text_obs, infos = self.envs.reset(kwargs=kwargs)
+        self.memory.reset(batch_size=len(text_obs))
+        self.pre_text_obs = text_obs
+        observations = {
+            "text": self.build_text_obs(text_obs, init=True),
+            "image": None,
+            "anchor": text_obs.copy(),
+            "max_prompt_length": self.observation_max_prompt_length,
+        }
+        return observations, infos
+
+    def step(self, text_actions: List[str]):
+        actions, valids = self.projection_f(text_actions)
+        text_obs, rewards, dones, infos = self.envs.step(actions)
+        # AgentGym-RL keeps the complete assistant messages, including reasoning,
+        # in its RolloutHandler. Preserve the original tagged model output here;
+        # projected actions are only for environment execution.
+        self.memory.store({"text_obs": self.pre_text_obs, "action": text_actions})
+        self.pre_text_obs = text_obs
+        for index, info in enumerate(infos):
+            info["is_action_valid"] = to_numpy(valids[index])
+        observations = {
+            "text": self.build_text_obs(text_obs),
+            "image": None,
+            "anchor": text_obs.copy(),
+            "max_prompt_length": self.observation_max_prompt_length,
+        }
+        return observations, to_numpy(rewards), to_numpy(dones), infos
+
+    def build_text_obs(self, text_obs: List[str], init: bool = False) -> List[str]:
+        if self.task_name == "webarena":
+            # AgentGym's WebArena observation endpoint already constructs the full
+            # objective, action-space, accessibility-tree, and action-history prompt.
+            # Override only its model-facing response format; the projection layer
+            # translates the extracted action back to WebArena's fenced protocol.
+            if init or self.config.env.history_length <= 0:
+                return [observation + WEBARENA_ACTION_FORMAT for observation in text_obs]
+            histories, _ = self.memory.fetch(
+                self.config.env.history_length,
+                obs_key="text_obs",
+                action_key="action",
+            )
+            return [
+                WEBARENA_TEMPLATE.format(
+                    action_history=histories[index],
+                    current_observation=observation,
+                    action_format=WEBARENA_ACTION_FORMAT,
+                )
+                for index, observation in enumerate(text_obs)
+            ]
+
+        histories = None
+        if not init and self.config.env.history_length > 0:
+            histories, _ = self.memory.fetch(
+                self.config.env.history_length,
+                obs_key="text_obs",
+                action_key="action",
+            )
+        prompts = []
+        for index, observation in enumerate(text_obs):
+            if histories is None:
+                prompt = SCIWORLD_TEMPLATE_NO_HIS.format(
+                    action_forms=SCIWORLD_ACTIONS,
+                    current_observation=observation,
+                )
+            else:
+                prompt = SCIWORLD_TEMPLATE.format(
+                    action_forms=SCIWORLD_ACTIONS,
+                    action_history=histories[index],
+                    current_observation=observation,
+                )
+            prompts.append(prompt)
+        return prompts
+
+    def _process_batch(self, batch_idx, total_batch_list, total_infos, success):
+        for index in reversed(range(len(total_batch_list[batch_idx]))):
+            if total_batch_list[batch_idx][index]["active_masks"]:
+                info = total_infos[batch_idx][index]
+                success["success_rate"].append(float(info.get("won", False)))
+                success[f"{self.task_name}_task_score (not success_rate)"].append(
+                    float(info.get("task_score", 0.0))
+                )
+                return
+
+
 def make_envs(config):
     """
     Create enviroments 
@@ -609,7 +716,47 @@ def make_envs(config):
     group_n = config.env.rollout.n if config.env.rollout.n > 0 else 1
     resources_per_worker = OmegaConf.to_container(config.env.resources_per_worker, resolve=True)
 
-    if "search" in config.env.env_name.lower():
+    if config.env.env_name.lower() in {"sciworld", "webarena"}:
+        from agent_system.environments.env_package.agentgym import (
+            build_agentgym_envs,
+            sciworld_projection,
+            webarena_projection,
+        )
+
+        task_name = config.env.env_name.lower()
+        agentgym_config = config.env.agentgym
+        fallback_train_ids = agentgym_config.get("train_task_ids", [])
+        fallback_val_ids = agentgym_config.get("val_task_ids", [])
+        common_kwargs = {
+            "task_name": task_name,
+            "env_addr": agentgym_config.env_addr,
+            "resources_per_worker": resources_per_worker,
+            "timeout": agentgym_config.timeout,
+            "max_retries": agentgym_config.max_retries,
+            "reward_scale": agentgym_config.reward_scale,
+        }
+        _envs = build_agentgym_envs(
+            seed=config.env.seed,
+            env_num=config.data.train_batch_size,
+            group_n=group_n,
+            is_train=True,
+            fallback_task_ids=fallback_train_ids,
+            **common_kwargs,
+        )
+        _val_envs = build_agentgym_envs(
+            seed=config.env.seed + 1000,
+            env_num=config.data.val_batch_size,
+            group_n=1,
+            is_train=False,
+            fallback_task_ids=fallback_val_ids,
+            **common_kwargs,
+        )
+        projection_f = sciworld_projection if task_name == "sciworld" else webarena_projection
+        return (
+            AgentGymEnvironmentManager(_envs, projection_f, config, task_name),
+            AgentGymEnvironmentManager(_val_envs, projection_f, config, task_name),
+        )
+    elif "search" in config.env.env_name.lower():
         from agent_system.environments.env_package.search import build_search_envs, search_projection
         _envs = build_search_envs(seed=config.env.seed, env_num=config.data.train_batch_size, group_n=group_n, is_train=True, env_config=config.env)
         _val_envs = build_search_envs(seed=config.env.seed + 1000, env_num=config.data.val_batch_size, group_n=1, is_train=False, env_config=config.env)
