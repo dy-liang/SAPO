@@ -142,7 +142,17 @@ class vLLMRollout(BaseRollout):
 
         max_model_len = int(config.max_model_len or config.prompt_length + config.response_length)
 
-        if max_num_batched_tokens < max_model_len and self.config.enable_chunked_prefill:
+        # AgentGym-RL intentionally combines an 8K scheduler budget with a
+        # 32K model context and chunked prefill.  Preserve the validation for
+        # every other rollout unless the environment script explicitly opts in.
+        allow_smaller_token_budget = bool(
+            self.config.get("allow_max_num_batched_tokens_below_max_model_len", False)
+        )
+        if (
+            max_num_batched_tokens < max_model_len
+            and self.config.enable_chunked_prefill
+            and not allow_smaller_token_budget
+        ):
             raise ValueError(
                 "Enable chunked prefill, max_num_batched_tokens is smaller than max_model_len, \
                              please increase max_num_batched_tokens or disable chunked prefill"
