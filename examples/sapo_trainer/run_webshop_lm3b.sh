@@ -3,7 +3,6 @@ set -x
 
 ENGINE=${1:-vllm}
 export VLLM_ATTENTION_BACKEND=${VLLM_ATTENTION_BACKEND:-XFORMERS}
-#export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-1}
 export HF_ENDPOINT=${HF_ENDPOINT:-https://hf-mirror.com}
 
 num_cpus_per_env_worker=${NUM_CPUS_PER_ENV_WORKER:-0.05}
@@ -67,8 +66,8 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.ppo_epochs=1 \
     actor_rollout_ref.actor.use_dynamic_bsz=False \
     actor_rollout_ref.actor.ulysses_sequence_parallel_size=1 \
-    actor_rollout_ref.actor.use_kl_loss=True \
-    actor_rollout_ref.actor.kl_loss_coef=0.01 \
+    actor_rollout_ref.actor.use_kl_loss=False \
+    actor_rollout_ref.actor.kl_loss_coef=0.0 \
     actor_rollout_ref.actor.kl_loss_type=low_var_kl \
     actor_rollout_ref.actor.grad_clip=1.0 \
     actor_rollout_ref.actor.fsdp_config.param_offload=False \

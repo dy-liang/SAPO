@@ -68,14 +68,14 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.ref.fsdp_config.param_offload=False \
     actor_rollout_ref.novelty_module.enable=False \
     env.env_name=alfworld/AlfredTWEnv \
-    env.seed=0 \
+    env.seed=3 \
     env.max_steps=50 \
     env.rollout.n=1 \
     env.resources_per_worker.num_cpus="$num_cpus_per_env_worker" \
     trainer.critic_warmup=0 \
     trainer.logger="['console','swanlab']" \
     trainer.project_name=verl_agent_alfworld \
-    trainer.experiment_name=qwen2.5_shared_head_ppo \
+    trainer.experiment_name=qwen2.5_shared_head_ppo_noscale \
     trainer.n_gpus_per_node=1 \
     trainer.nnodes=1 \
     trainer.save_freq=150 \

@@ -3,9 +3,8 @@ set -x
 
 ENGINE=${1:-vllm}
 export VLLM_ATTENTION_BACKEND=${VLLM_ATTENTION_BACKEND:-XFORMERS}
-export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
 
-model_path=${MODEL_PATH:-$HOME/.cache/modelscope/hub/models/LLM-Research/Meta-Llama-3.2-3B-Instruct}
+model_path=${MODEL_PATH:-$HOME/.cache/modelscope/hub/models/LLM-Research/Llama-3.2-3B-Instruct}
 train_data_size=${TRAIN_DATA_SIZE:-128}
 val_data_size=${VAL_DATA_SIZE:-128}
 num_cpus_per_env_worker=${NUM_CPUS_PER_ENV_WORKER:-0.02}
@@ -68,15 +67,15 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.ref.fsdp_config.param_offload=False \
     actor_rollout_ref.novelty_module.enable=False \
     env.env_name=alfworld/AlfredTWEnv \
-    env.seed=0 \
+    env.seed=3 \
     env.max_steps=50 \
     env.rollout.n=1 \
     env.resources_per_worker.num_cpus="$num_cpus_per_env_worker" \
     trainer.critic_warmup=0 \
     trainer.logger="['console','swanlab']" \
     trainer.project_name=verl_agent_alfworld \
-    trainer.experiment_name=llama3.2_3b_shared_head_ppo \
-    trainer.n_gpus_per_node=1 \
+    trainer.experiment_name=llama3.2_3b_shared_head_ppo_noscale \
+    trainer.n_gpus_per_node=2 \
     trainer.nnodes=1 \
     trainer.save_freq=150 \
     trainer.test_freq=5 \

@@ -3,7 +3,6 @@ set -x
 
 ENGINE=${1:-vllm}
 export VLLM_ATTENTION_BACKEND=${VLLM_ATTENTION_BACKEND:-XFORMERS}
-#export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-1}
 export HF_ENDPOINT=${HF_ENDPOINT:-https://hf-mirror.com}
 
 num_cpus_per_env_worker=${NUM_CPUS_PER_ENV_WORKER:-0.02}
@@ -58,7 +57,7 @@ python3 -m verl.trainer.main_ppo \
     data.filter_overlong_prompts=True \
     data.truncation=error \
     data.return_raw_chat=True \
-    actor_rollout_ref.model.path=$HOME/.cache/modelscope/hub/models/LLM-Research/Meta-Llama-3.2-3B-Instruct \
+    actor_rollout_ref.model.path=$HOME/.cache/modelscope/hub/models/LLM-Research/Llama-3.2-3B-Instruct \
     actor_rollout_ref.model.use_remove_padding=True \
     actor_rollout_ref.model.use_fused_kernels=False \
     actor_rollout_ref.model.lora_rank=0 \
@@ -101,7 +100,7 @@ python3 -m verl.trainer.main_ppo \
     trainer.experiment_name=sapo_llama3.2_3b_s3 \
     trainer.n_gpus_per_node=2 \
     trainer.nnodes=1 \
-    trainer.save_freq=-1 \
+    trainer.save_freq=150 \
     trainer.test_freq=5 \
     trainer.total_epochs=152 \
     trainer.val_before_train=True \

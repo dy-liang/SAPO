@@ -2,9 +2,8 @@
 set -x
 ENGINE=${1:-vllm}
 export VLLM_ATTENTION_BACKEND=${VLLM_ATTENTION_BACKEND:-XFORMERS}
-export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
 
-num_cpus_per_env_worker=${NUM_CPUS_PER_ENV_WORKER:-0.05}
+num_cpus_per_env_worker=${NUM_CPUS_PER_ENV_WORKER:-0.02}
 train_data_size=${TRAIN_DATA_SIZE:-128}
 val_data_size=${VAL_DATA_SIZE:-128}
 spo_offline_values=${SPO_OFFLINE_VALUES:-null}
@@ -48,7 +47,7 @@ python3 -m verl.trainer.main_ppo \
     data.filter_overlong_prompts=True \
     data.truncation=error \
     data.return_raw_chat=True \
-    actor_rollout_ref.model.path=$HOME/.cache/modelscope/hub/models/LLM-Research/Meta-Llama-3.2-3B-Instruct \
+    actor_rollout_ref.model.path=$HOME/.cache/modelscope/hub/models/LLM-Research/Llama-3.2-3B-Instruct \
     actor_rollout_ref.model.use_remove_padding=True \
     actor_rollout_ref.model.use_fused_kernels=False \
     actor_rollout_ref.model.lora_rank=0 \
@@ -60,7 +59,6 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.use_dynamic_bsz=False \
     actor_rollout_ref.actor.clip_ratio_low=0.2 \
     actor_rollout_ref.actor.clip_ratio_high=0.28 \
-    actor_rollout_ref.actor.clip_ratio_c=10 \
     actor_rollout_ref.actor.use_kl_loss=False \
     actor_rollout_ref.actor.kl_loss_coef=0.0 \
     actor_rollout_ref.actor.kl_loss_type=low_var_kl \
@@ -76,7 +74,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.temperature=1.0 \
     actor_rollout_ref.rollout.top_p=1.0 \
     actor_rollout_ref.rollout.top_k=-1 \
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.6 \
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.65 \
     actor_rollout_ref.rollout.enable_chunked_prefill=False \
     actor_rollout_ref.rollout.enforce_eager=False \
     actor_rollout_ref.rollout.free_cache_engine=False \
@@ -86,7 +84,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
     actor_rollout_ref.novelty_module.enable=False \
     env.env_name=Webshop \
-    env.seed=0 \
+    env.seed=3 \
     env.max_steps=15 \
     env.rollout.n=1 \
     env.resources_per_worker.num_cpus="$num_cpus_per_env_worker" \
@@ -94,7 +92,7 @@ python3 -m verl.trainer.main_ppo \
     trainer.logger="['console','swanlab']" \
     trainer.project_name=verl_agent_webshop \
     trainer.experiment_name="$experiment_name" \
-    trainer.n_gpus_per_node=1 \
+    trainer.n_gpus_per_node=2 \
     trainer.nnodes=1 \
     trainer.save_freq=150 \
     trainer.test_freq=5 \

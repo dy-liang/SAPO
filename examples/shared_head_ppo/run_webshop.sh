@@ -3,7 +3,6 @@ set -x
 
 ENGINE=${1:-vllm}
 export VLLM_ATTENTION_BACKEND=${VLLM_ATTENTION_BACKEND:-XFORMERS}
-export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
 
 model_path=${MODEL_PATH:-$HOME/.cache/modelscope/hub/models/Qwen/Qwen2.5-1.5B-Instruct}
 train_data_size=${TRAIN_DATA_SIZE:-128}
@@ -23,7 +22,7 @@ python3 -m verl.trainer.main_ppo \
     algorithm.use_kl_in_reward=False \
     algorithm.shared_head_ppo.enable=True \
     algorithm.shared_head_ppo.scale_value_target=False \
-    algorithm.shared_head_ppo.value_cliprange=2 \
+    algorithm.shared_head_ppo.value_cliprange=0.5 \
     algorithm.shared_head_ppo.value_loss_coef=0.1 \
     algorithm.shared_head_ppo.normalize_turn_advantage=True \
     data.train_files="$HOME/data/verl-agent/text/train.parquet" \
@@ -68,15 +67,15 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
     actor_rollout_ref.novelty_module.enable=False \
     env.env_name=Webshop \
-    env.seed=0 \
+    env.seed=3 \
     env.max_steps=15 \
     env.rollout.n=1 \
     env.resources_per_worker.num_cpus="$num_cpus_per_env_worker" \
     trainer.critic_warmup=0 \
     trainer.logger="['console','swanlab']" \
     trainer.project_name=verl_agent_webshop \
-    trainer.experiment_name=qwen2.5_shared_head_ppo \
-    trainer.n_gpus_per_node=1 \
+    trainer.experiment_name=qwen2.5_shared_head_ppo_noscale \
+    trainer.n_gpus_per_node=2 \
     trainer.nnodes=1 \
     trainer.save_freq=150 \
     trainer.test_freq=5 \
