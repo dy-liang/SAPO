@@ -47,6 +47,7 @@ class AgentGymHttpClient:
         timeout: float = 600.0,
         max_retries: int = 3,
         reward_scale: float = 1.0,
+        max_steps: int = 20,
     ):
         task_name = task_name.lower()
         if task_name not in {"sciworld", "webarena"}:
@@ -58,9 +59,13 @@ class AgentGymHttpClient:
         self.reward_scale = float(reward_scale)
         if self.reward_scale <= 0.0:
             raise ValueError(f"reward_scale must be positive, got {self.reward_scale}")
+        self.max_steps = int(max_steps)
+        if self.max_steps <= 0:
+            raise ValueError(f"max_steps must be positive, got {self.max_steps}")
         self.session = requests.Session()
         self.env_id = self._create()
         self.last_score = 0.0
+        self.step_count = 0
         self.last_observation = ""
         self.last_info: Dict[str, Any] = {}
 
@@ -95,6 +100,7 @@ class AgentGymHttpClient:
     def reset(self, task_id: int):
         task_id = int(task_id)
         self.last_score = 0.0
+        self.step_count = 0
         if self.task_name == "sciworld":
             payload = self._request(
                 "POST",
@@ -143,6 +149,7 @@ class AgentGymHttpClient:
         return self.last_observation, dict(self.last_info)
 
     def step(self, action: str):
+        self.step_count += 1
         if self.task_name == "sciworld":
             payload = self._request(
                 "POST",
@@ -150,15 +157,21 @@ class AgentGymHttpClient:
                 json={"id": self.env_id, "action": action},
             )
             score = float(payload["score"])
-            reward = (score - self.last_score) * self.reward_scale
             self.last_score = score
             done = bool(payload["done"])
+            reached_step_limit = self.step_count >= self.max_steps
+            # AgentGym-RL keeps overwriting the trajectory score and emits only
+            # the last cumulative score. Reproduce that turn-level behavior for
+            # both early termination and max-round truncation.
+            reward = score * self.reward_scale if done or reached_step_limit else 0.0
             self.last_observation = str(payload["observation"])
             self.last_info.update(
                 {
                     "raw_reward": float(payload.get("reward", 0.0)),
                     "task_score": score,
                     "reward_scale": self.reward_scale,
+                    "reward_is_terminal": done or reached_step_limit,
+                    "truncated": reached_step_limit and not done,
                     "won": done and score >= 100.0,
                 }
             )
@@ -202,6 +215,7 @@ class AgentGymWorker:
         timeout: float,
         max_retries: int,
         reward_scale: float,
+        max_steps: int,
     ):
         self.client = AgentGymHttpClient(
             task_name,
@@ -209,6 +223,7 @@ class AgentGymWorker:
             timeout,
             max_retries,
             reward_scale,
+            max_steps,
         )
         self.reset_error = None
 
@@ -236,14 +251,10 @@ class AgentGymWorker:
         try:
             return self.client.step(action)
         except Exception as exc:
-            # Previous SciWorld deltas may already have been accumulated. Emit
-            # their negative sum so the failed rollout's final score is zero,
-            # matching AgentGym-RL's exception path.
-            reward = (
-                -self.client.last_score * self.client.reward_scale
-                if self.client.task_name == "sciworld"
-                else 0.0
-            )
+            # AgentGym-RL assigns a zero trajectory score on a rollout error.
+            # Intermediate SciWorld rewards are zero, so no compensation is
+            # required when the failed rollout terminates.
+            reward = 0.0
             self.client.last_score = 0.0
             info = dict(self.client.last_info)
             info.update(
@@ -292,6 +303,7 @@ class AgentGymRemoteEnv:
         timeout: float,
         max_retries: int,
         reward_scale: float,
+        max_steps: int,
         fallback_task_ids: Optional[Iterable[int]] = None,
     ):
         if not ray.is_initialized():
@@ -300,6 +312,9 @@ class AgentGymRemoteEnv:
         self.env_num = int(env_num)
         self.group_n = int(group_n)
         self.num_processes = self.env_num * self.group_n
+        # Capacity is fixed at construction, while the final dataloader batch
+        # can be smaller (for example, 200 validation tasks with batch size 32).
+        self._active_count = 0
         self.is_train = bool(is_train)
         self._rng = np.random.RandomState(seed)
         self._fallback_task_ids = list([] if fallback_task_ids is None else fallback_task_ids)
@@ -311,6 +326,7 @@ class AgentGymRemoteEnv:
                 timeout,
                 max_retries,
                 reward_scale,
+                max_steps,
             )
             for _ in range(self.num_processes)
         ]
@@ -334,19 +350,32 @@ class AgentGymRemoteEnv:
             task_ids = np.repeat(sampled, self.group_n).astype(int).tolist()
         elif len(task_ids) == self.env_num and self.group_n > 1:
             task_ids = np.repeat(task_ids, self.group_n).astype(int).tolist()
-        if len(task_ids) != self.num_processes:
-            raise ValueError(f"Expected {self.num_processes} AgentGym task IDs, got {len(task_ids)}")
+        if not task_ids:
+            raise ValueError("AgentGym reset received an empty task-ID batch")
+        if len(task_ids) > self.num_processes:
+            raise ValueError(
+                f"AgentGym environment capacity is {self.num_processes}, got {len(task_ids)} task IDs"
+            )
+        if self.group_n > 1 and len(task_ids) % self.group_n != 0:
+            raise ValueError(
+                f"Grouped AgentGym task-ID count {len(task_ids)} must be divisible by group_n={self.group_n}"
+            )
 
-        results = ray.get([worker.reset.remote(task_id) for worker, task_id in zip(self._workers, task_ids)])
-        self._dones = [False] * self.num_processes
+        self._active_count = len(task_ids)
+        active_workers = self._workers[: self._active_count]
+        results = ray.get(
+            [worker.reset.remote(task_id) for worker, task_id in zip(active_workers, task_ids)]
+        )
+        self._dones = [False] * self._active_count
         self._last = [(obs, info) for obs, info in results]
         return [item[0] for item in results], [item[1] for item in results]
 
     def step(self, actions):
-        if len(actions) != self.num_processes:
-            raise ValueError(f"Expected {self.num_processes} actions, got {len(actions)}")
+        if len(actions) != self._active_count:
+            raise ValueError(f"Expected {self._active_count} active actions, got {len(actions)}")
         futures, active_indices = [], []
-        for index, (worker, action, done) in enumerate(zip(self._workers, actions, self._dones)):
+        active_workers = self._workers[: self._active_count]
+        for index, (worker, action, done) in enumerate(zip(active_workers, actions, self._dones)):
             if not done:
                 futures.append(worker.step.remote(action))
                 active_indices.append(index)
@@ -354,7 +383,7 @@ class AgentGymRemoteEnv:
         by_index = dict(zip(active_indices, active_results))
 
         observations, rewards, dones, infos = [], [], [], []
-        for index in range(self.num_processes):
+        for index in range(self._active_count):
             if index in by_index:
                 obs, reward, done, info = by_index[index]
                 self._dones[index] = bool(done)
@@ -389,6 +418,7 @@ def build_agentgym_envs(
     timeout: float = 600.0,
     max_retries: int = 3,
     reward_scale: float = 1.0,
+    max_steps: int = 20,
     fallback_task_ids: Optional[Iterable[int]] = None,
 ):
     return AgentGymRemoteEnv(
@@ -402,5 +432,6 @@ def build_agentgym_envs(
         timeout=timeout,
         max_retries=max_retries,
         reward_scale=reward_scale,
+        max_steps=max_steps,
         fallback_task_ids=fallback_task_ids,
     )

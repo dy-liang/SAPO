@@ -19,18 +19,66 @@ import argparse
 import json
 import os
 from pathlib import Path
-from urllib.request import urlopen
+from urllib.error import HTTPError, URLError
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from datasets import Dataset
 
 
-DATASET_BASE = "https://huggingface.co/datasets/AgentGym/AgentGym-RL-Data-ID/resolve/main"
+HF_ENDPOINT = os.environ.get("HF_ENDPOINT", "https://huggingface.co").rstrip("/")
+DEFAULT_DATASET_REPO = os.environ.get(
+    "AGENTGYM_DATASET_REPO",
+    f"{HF_ENDPOINT}/datasets/AgentGym/AgentGym-RL-Data-ID",
+)
+DEFAULT_OUTPUT_DIR = os.environ.get(
+    "AGENTGYM_DATA_DIR",
+    "~/data/verl-agent/agentgym",
+)
+
+
+class _MirrorRedirectHandler(HTTPRedirectHandler):
+    """Add 308 support for mirrors when the Python runtime lacks it."""
+
+    def http_error_308(self, request, response, code, message, headers):
+        return self.http_error_302(request, response, 302, message, headers)
+
+
+def _dataset_file(dataset_repo: str, relative_path: str) -> str:
+    """Resolve a file from an HF repo URL, mirror URL, or local clone."""
+    dataset_repo = os.path.expanduser(dataset_repo).rstrip("/")
+    if dataset_repo.startswith(("http://", "https://")):
+        if dataset_repo.endswith("/tree/main"):
+            dataset_repo = dataset_repo[: -len("/tree/main")]
+        if not dataset_repo.endswith("/resolve/main"):
+            dataset_repo = f"{dataset_repo}/resolve/main"
+        return f"{dataset_repo}/{relative_path}"
+    return str(Path(dataset_repo) / relative_path)
 
 
 def _load_records(source: str):
     if source.startswith(("http://", "https://")):
-        with urlopen(source, timeout=60) as response:
-            return json.load(response)
+        request = Request(
+            source,
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                    "Chrome/124.0 Safari/537.36"
+                ),
+                "Accept": "application/json, text/plain, */*",
+            },
+        )
+        try:
+            with build_opener(_MirrorRedirectHandler()).open(
+                request, timeout=60
+            ) as response:
+                return json.load(response)
+        except (HTTPError, URLError, ValueError) as exc:
+            raise RuntimeError(
+                f"Unable to download AgentGym task IDs from {source!r}: {exc}. "
+                "If the Hugging Face endpoint blocks Python downloads, clone "
+                "AgentGym-RL-Data-ID and set AGENTGYM_DATASET_REPO to that "
+                "local directory."
+            ) from exc
     with open(os.path.expanduser(source), encoding="utf-8") as handle:
         return json.load(handle)
 
@@ -70,18 +118,36 @@ def _rows(records, environment: str, split: str, limit: int):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--environment", required=True, choices=["sciworld", "webarena"])
-    parser.add_argument("--local_dir", default="~/data/verl-agent/agentgym")
+    parser.add_argument(
+        "--local_dir",
+        default=DEFAULT_OUTPUT_DIR,
+        help=(
+            "Root output directory. Defaults to AGENTGYM_DATA_DIR or "
+            "~/data/verl-agent/agentgym. The environment name is appended once."
+        ),
+    )
+    parser.add_argument(
+        "--dataset_repo",
+        default=DEFAULT_DATASET_REPO,
+        help=(
+            "Hugging Face dataset repository URL or a local git clone. "
+            "AGENTGYM_DATASET_REPO and HF_ENDPOINT are honored when this "
+            "option is omitted."
+        ),
+    )
     parser.add_argument("--train_id_file", default=None)
     parser.add_argument("--val_id_file", default=None)
     parser.add_argument("--train_data_size", type=int, default=0, help="0 keeps the complete official split")
     parser.add_argument("--val_data_size", type=int, default=0, help="0 keeps the complete official split")
     args = parser.parse_args()
 
-    train_source = args.train_id_file or (
-        f"{DATASET_BASE}/train/{args.environment}_train.json"
+    train_source = args.train_id_file or _dataset_file(
+        args.dataset_repo,
+        f"train/{args.environment}_train.json",
     )
-    val_source = args.val_id_file or (
-        f"{DATASET_BASE}/eval/{args.environment}_test.json"
+    val_source = args.val_id_file or _dataset_file(
+        args.dataset_repo,
+        f"eval/{args.environment}_test.json",
     )
     output_dir = Path(os.path.expanduser(args.local_dir)) / args.environment
     output_dir.mkdir(parents=True, exist_ok=True)

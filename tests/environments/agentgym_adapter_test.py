@@ -49,6 +49,29 @@ class FakeSession:
         pass
 
 
+class FakeRemoteMethod:
+    def __init__(self, function):
+        self.function = function
+
+    def remote(self, *args):
+        return self.function(*args)
+
+
+class FakeAgentGymWorker:
+    def __init__(self, index):
+        self.index = index
+        self.reset_calls = []
+        self.reset = FakeRemoteMethod(self._reset)
+        self.step = FakeRemoteMethod(self._step)
+
+    def _reset(self, task_id):
+        self.reset_calls.append(task_id)
+        return f"obs-{task_id}", {"task_id": task_id, "won": False}
+
+    def _step(self, action):
+        return f"next-{self.index}", 0.0, False, {"won": False, "action": action}
+
+
 def test_sciworld_projection_requires_original_sapo_tags():
     actions, valids = projection.sciworld_projection(
         [
@@ -99,7 +122,7 @@ def test_sciworld_task_description_is_kept_once_via_full_history():
     assert later_prompt.count(task) == 1
 
 
-def test_sciworld_cumulative_score_is_converted_to_step_deltas():
+def test_sciworld_only_emits_final_cumulative_score_on_termination():
     fake = FakeSession(
         [
             {"id": 7},
@@ -124,10 +147,39 @@ def test_sciworld_cumulative_score_is_converted_to_step_deltas():
 
     assert "measure temperature" in observation
     assert info["task_id"] == 12
-    assert (reward_1, reward_2) == pytest.approx((1.0, 1.5))
+    assert (reward_1, reward_2) == pytest.approx((0.0, 2.5))
     assert reward_1 + reward_2 == pytest.approx(info_2["task_score"] * 0.1)
     assert info_2["reward_scale"] == pytest.approx(0.1)
+    assert info_2["reward_is_terminal"] is True
     assert not done_1 and done_2
+
+
+def test_sciworld_emits_partial_score_on_last_configured_turn():
+    fake = FakeSession(
+        [
+            {"id": 8},
+            {
+                "task_description": "measure temperature",
+                "observation": "You are in the lab.",
+                "task_name": "task-1",
+                "var_num": 2,
+            },
+            {"observation": "partial-1", "reward": 10, "score": 10, "done": False},
+            {"observation": "partial-2", "reward": 15, "score": 25, "done": False},
+        ]
+    )
+    with patch.object(agentgym_envs.requests, "Session", return_value=fake):
+        client = agentgym_envs.AgentGymHttpClient(
+            "sciworld", "http://env", reward_scale=0.1, max_steps=2
+        )
+        client.reset(12)
+        _, reward_1, done_1, _ = client.step("look around")
+        _, reward_2, done_2, info_2 = client.step("focus on thermometer")
+
+    assert (reward_1, reward_2) == pytest.approx((0.0, 2.5))
+    assert not done_1 and not done_2
+    assert info_2["reward_is_terminal"] is True
+    assert info_2["truncated"] is True
 
 
 def test_webarena_only_emits_terminal_evaluator_reward():
@@ -173,8 +225,38 @@ def test_task_id_validation_and_group_expansion_inputs():
         agentgym_envs._task_ids_from_kwargs([{"other": 1}])
 
 
+def test_remote_env_accepts_partial_final_validation_batch():
+    remote = agentgym_envs.AgentGymRemoteEnv.__new__(agentgym_envs.AgentGymRemoteEnv)
+    remote.env_num = 32
+    remote.group_n = 1
+    remote.num_processes = 32
+    remote._active_count = 0
+    remote._fallback_task_ids = []
+    remote._workers = [FakeAgentGymWorker(index) for index in range(32)]
+    remote._dones = []
+    remote._last = []
+
+    kwargs = [{"task_id": task_id} for task_id in range(8)]
+    with patch.object(agentgym_envs.ray, "get", side_effect=lambda values: values):
+        observations, infos = remote.reset(kwargs=kwargs)
+        next_observations, rewards, dones, next_infos = remote.step(["wait"] * 8)
+
+    assert remote._active_count == 8
+    assert len(observations) == len(infos) == 8
+    assert len(next_observations) == len(rewards) == len(dones) == len(next_infos) == 8
+    assert [worker.reset_calls for worker in remote._workers[:8]] == [[index] for index in range(8)]
+    assert all(not worker.reset_calls for worker in remote._workers[8:])
+
+
 def test_reward_scale_must_be_positive():
     with pytest.raises(ValueError, match="reward_scale"):
         agentgym_envs.AgentGymHttpClient(
             "sciworld", "http://env", reward_scale=0.0
+        )
+
+
+def test_max_steps_must_be_positive():
+    with pytest.raises(ValueError, match="max_steps"):
+        agentgym_envs.AgentGymHttpClient(
+            "sciworld", "http://env", max_steps=0
         )

@@ -228,6 +228,26 @@ server startup, connectivity checks, training commands, evaluation behavior,
 and troubleshooting notes. See the complete
 [SciWorld/WebArena setup and training guide](agent_system/environments/README.md#6-agentgym-sciworld-and-webarena).
 
+## SciWorld Env Setup
+Before running: You will have to have Java 1.8+ installed on your system (shipped with most linux distributions).
+``` sh
+git clone https://hf-mirror.com/datasets/AgentGym/AgentGym-RL-Data-ID
+
+conda create --name agentenv-sciworld python=3.8
+conda activate agentenv-sciworld
+conda install -c conda-forge openjdk=11 -y
+
+git clone --recursive https://github.com/WooooDyy/AgentGym.git
+cd ./AgentGym/agentenv-sciworld
+pip install -e .
+```
+
+## Launch Server
+
+``` sh
+sciworld --host 0.0.0.0 --port 36001
+```
+
 ## Examples
 
 The launch scripts follow the `verl-agent` convention. Update model paths, GPU allocation, and environment-specific data paths in the corresponding shell script before launching a run.

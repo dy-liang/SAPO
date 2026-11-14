@@ -734,6 +734,7 @@ def make_envs(config):
             "timeout": agentgym_config.timeout,
             "max_retries": agentgym_config.max_retries,
             "reward_scale": agentgym_config.reward_scale,
+            "max_steps": config.env.max_steps,
         }
         _envs = build_agentgym_envs(
             seed=config.env.seed,

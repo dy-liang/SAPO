@@ -214,15 +214,16 @@ from the SAPO repository root:
 conda activate sapo
 cd /path/to/SAPO
 
-export AGENTGYM_DATA_DIR=/path/to/agentgym-data
+DATA_DIR=${AGENTGYM_DATA_DIR:-$HOME/data/verl-agent/agentgym}
+export AGENTGYM_DATA_DIR="$DATA_DIR"
 
 python3 -m examples.data_preprocess.prepare_agentgym \
   --environment sciworld \
-  --local_dir "$AGENTGYM_DATA_DIR"
+  --local_dir "$DATA_DIR"
 
 python3 -m examples.data_preprocess.prepare_agentgym \
   --environment webarena \
-  --local_dir "$AGENTGYM_DATA_DIR"
+  --local_dir "$DATA_DIR"
 ```
 
 The converter downloads the official task IDs from the
@@ -230,7 +231,7 @@ The converter downloads the official task IDs from the
 and creates:
 
 ```text
-/path/to/agentgym-data/
+$HOME/data/verl-agent/agentgym/
 ├── sciworld/
 │   ├── train.parquet
 │   └── test.parquet
@@ -246,6 +247,37 @@ environment for each rollout. For a small installation smoke test, pass
 Local copies of the official JSON files can be supplied with
 `--train_id_file` and `--val_id_file`.
 
+If `huggingface.co` is unavailable, select the Hugging Face mirror before
+running the converter or any training script:
+
+```bash
+export HF_ENDPOINT=https://hf-mirror.com
+
+python3 -m examples.data_preprocess.prepare_agentgym \
+  --environment sciworld \
+  --local_dir "$DATA_DIR"
+```
+
+The converter treats `HF_ENDPOINT` as a repository endpoint and automatically
+builds valid `resolve/main/train/...` and `resolve/main/eval/...` file URLs. Do
+not append `train` or `eval` directly to the dataset's HTML page URL.
+
+Alternatively, clone the complete dataset and convert from the local directory:
+
+```bash
+git clone https://hf-mirror.com/datasets/AgentGym/AgentGym-RL-Data-ID
+
+export AGENTGYM_DATASET_REPO=/path/to/AgentGym-RL-Data-ID
+
+python3 -m examples.data_preprocess.prepare_agentgym \
+  --environment sciworld \
+  --dataset_repo "$AGENTGYM_DATASET_REPO" \
+  --local_dir "$DATA_DIR"
+```
+
+Keeping `AGENTGYM_DATASET_REPO` exported also makes all six training scripts
+reuse the local clone when they invoke the converter automatically.
+
 The six launch scripts call this converter automatically, so the manual step is
 mainly useful for checking data access before allocating GPUs.
 
@@ -259,7 +291,8 @@ conda activate sapo
 cd /path/to/SAPO
 
 export MODEL_PATH=Qwen/Qwen2.5-7B-Instruct
-export AGENTGYM_DATA_DIR=/path/to/agentgym-data
+DATA_DIR=${AGENTGYM_DATA_DIR:-$HOME/data/verl-agent/agentgym}
+export AGENTGYM_DATA_DIR="$DATA_DIR"
 export N_GPUS=2
 ```
 
@@ -331,7 +364,9 @@ The training scripts use the official `test.parquet` split for validation and
 enable `trainer.val_before_train=True`. Evaluation then runs every
 `trainer.test_freq=5` training steps by default; no separate evaluator process
 is required. The SciWorld and WebArena servers must remain available during
-validation.
+validation. Validation environment pools accept a smaller final dataloader
+batch; for example, 200 SciWorld test tasks with `VAL_BATCH_SIZE=32` run as six
+full batches of 32 followed by one batch of 8.
 
 Reported `success_rate` uses the terminal benchmark result. The additional
 `sciworld_task_score (not success_rate)` and
@@ -348,9 +383,11 @@ required by the upstream server.
 
 Reward handling intentionally follows AgentGym-RL:
 
-- SciWorld exposes a cumulative score. The adapter first converts it to score
-  deltas so it is never double-counted, then the supplied 7B scripts apply a
-  `0.1` training scale (raw 0–100 becomes 0–10).
+- SciWorld exposes a cumulative score. Matching AgentGym-RL, intermediate turns
+  receive zero reward and the final turn receives the latest cumulative score.
+  This also applies when the rollout reaches `env.max_steps` without environment
+  termination. The supplied 7B scripts apply a `0.1` training scale (raw 0–100
+  becomes 0–10).
 - WebArena emits zero on non-terminal steps and the evaluator reward only on
   termination. The supplied scripts scale its raw 0/1 evaluator result to 0/10.
 
