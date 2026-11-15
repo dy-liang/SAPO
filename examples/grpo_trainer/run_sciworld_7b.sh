@@ -1,17 +1,21 @@
 #!/usr/bin/env bash
+ulimit -n 65535
 set -euo pipefail
 set -x
 
 ENGINE=${1:-vllm}
 export VLLM_ATTENTION_BACKEND=${VLLM_ATTENTION_BACKEND:-XFORMERS}
+export HF_ENDPOINT=${HF_ENDPOINT:-https://hf-mirror.com}
+export TMPDIR=/tmp
+export PYTHONUNBUFFERED=1
+DATALOADER_NUM_WORKERS=${DATALOADER_NUM_WORKERS:-0}
 
 DATA_DIR=${AGENTGYM_DATA_DIR:-$HOME/data/verl-agent/agentgym}
 ENV_ADDR=${AGENTGYM_ENV_ADDR:-http://127.0.0.1:36001}
-MODEL_PATH=${MODEL_PATH:-Qwen/Qwen2.5-7B-Instruct}
+MODEL_PATH=${MODEL_PATH:-$HOME/.cache/modelscope/hub/models/Qwen/Qwen2.5-7B-Instruct}
 TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE:-16}
 VAL_BATCH_SIZE=${VAL_BATCH_SIZE:-4}
 GROUP_SIZE=${GROUP_SIZE:-8}
-TOTAL_TRAINING_STEPS=${TOTAL_TRAINING_STEPS:-160} # match ppo/sapo step
 N_GPUS=${N_GPUS:-2}
 
 python3 -m examples.data_preprocess.prepare_agentgym \
@@ -27,6 +31,7 @@ python3 -m verl.trainer.main_ppo \
     data.val_batch_size="$VAL_BATCH_SIZE" \
     data.max_prompt_length=1024 \
     data.max_response_length=4096 \
+    +data.dataloader_num_workers="$DATALOADER_NUM_WORKERS" \
     data.filter_overlong_prompts=True \
     data.truncation=error \
     data.return_raw_chat=True \
@@ -34,8 +39,10 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.model.use_remove_padding=True \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
     actor_rollout_ref.actor.optim.lr=1e-6 \
-    actor_rollout_ref.actor.ppo_mini_batch_size=4 \
-    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=2 \
+    actor_rollout_ref.actor.ppo_mini_batch_size=64 \
+    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=8 \
+    actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=32 \
+    actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=32 \
     actor_rollout_ref.actor.ppo_epochs=1 \
     actor_rollout_ref.actor.use_kl_loss=True \
     actor_rollout_ref.actor.kl_loss_coef=0.001 \
@@ -50,7 +57,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.max_num_batched_tokens=8192 \
     actor_rollout_ref.rollout.max_model_len=32768 \
     +actor_rollout_ref.rollout.allow_max_num_batched_tokens_below_max_model_len=True \
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.7 \
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.4 \
     actor_rollout_ref.rollout.enable_chunked_prefill=True \
     actor_rollout_ref.rollout.free_cache_engine=False \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
@@ -65,14 +72,14 @@ python3 -m verl.trainer.main_ppo \
     env.max_steps=20 \
     env.rollout.n="$GROUP_SIZE" \
     env.resources_per_worker.num_cpus=0.02 \
-    trainer.logger="['console','wandb']" \
+    trainer.logger="['console','swanlab']" \
     trainer.project_name=verl_agent_sciworld \
     trainer.experiment_name=grpo_qwen2.5_7b \
     trainer.n_gpus_per_node="$N_GPUS" \
     trainer.nnodes=1 \
-    trainer.save_freq=25 \
-    trainer.test_freq=5 \
+    trainer.save_freq=50 \
+    trainer.test_freq=-1 \
     trainer.total_epochs=10 \
-    trainer.total_training_steps="$TOTAL_TRAINING_STEPS" \
-    trainer.val_before_train=True \
+    trainer.total_training_steps=160 \
+    trainer.val_before_train=False \
     "${@:2}"

@@ -4,10 +4,14 @@ set -x
 
 ENGINE=${1:-vllm}
 export VLLM_ATTENTION_BACKEND=${VLLM_ATTENTION_BACKEND:-XFORMERS}
+export HF_ENDPOINT=${HF_ENDPOINT:-https://hf-mirror.com}
+export TMPDIR=/tmp
+export PYTHONUNBUFFERED=1
+DATALOADER_NUM_WORKERS=${DATALOADER_NUM_WORKERS:-0}
 
 DATA_DIR=${AGENTGYM_DATA_DIR:-$HOME/data/verl-agent/agentgym}
 ENV_ADDR=${AGENTGYM_ENV_ADDR:-http://127.0.0.1:36001}
-MODEL_PATH=${MODEL_PATH:-Qwen/Qwen2.5-7B-Instruct}
+MODEL_PATH=${MODEL_PATH:-$HOME/.cache/modelscope/hub/models/Qwen/Qwen2.5-7B-Instruct}
 TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE:-128}
 VAL_BATCH_SIZE=${VAL_BATCH_SIZE:-4}
 N_GPUS=${N_GPUS:-2}
@@ -38,6 +42,7 @@ python3 -m verl.trainer.main_ppo \
     data.val_files="$DATA_DIR/sciworld/test.parquet" \
     data.train_batch_size="$TRAIN_BATCH_SIZE" \
     data.val_batch_size="$VAL_BATCH_SIZE" \
+    +data.dataloader_num_workers="$DATALOADER_NUM_WORKERS" \
     data.max_prompt_length=1024 \
     data.max_response_length=4096 \
     data.filter_overlong_prompts=True \
@@ -47,8 +52,10 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.model.use_remove_padding=True \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
     actor_rollout_ref.actor.optim.lr=1e-6 \
-    actor_rollout_ref.actor.ppo_mini_batch_size=4 \
-    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=2 \
+    actor_rollout_ref.actor.ppo_mini_batch_size=64 \
+    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=8 \
+    actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=32 \
+    actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=32 \
     actor_rollout_ref.actor.ppo_epochs=1 \
     actor_rollout_ref.actor.use_kl_loss=True \
     actor_rollout_ref.actor.kl_loss_coef=0.001 \
@@ -64,10 +71,10 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.max_model_len=32768 \
     +actor_rollout_ref.rollout.allow_max_num_batched_tokens_below_max_model_len=True \
     actor_rollout_ref.rollout.n=1 \
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.7 \
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.45 \
     actor_rollout_ref.rollout.enable_chunked_prefill=True \
     actor_rollout_ref.rollout.free_cache_engine=False \
-    actor_rollout_ref.ref.fsdp_config.param_offload=True \
+    actor_rollout_ref.ref.fsdp_config.param_offload=False \
     actor_rollout_ref.novelty_module.enable=False \
     env.env_name=sciworld \
     env.agentgym.env_addr="$ENV_ADDR" \
@@ -84,8 +91,8 @@ python3 -m verl.trainer.main_ppo \
     trainer.experiment_name=qwen2.5_7b_SAPO \
     trainer.n_gpus_per_node="$N_GPUS" \
     trainer.nnodes=1 \
-    trainer.save_freq=-1 \
-    trainer.test_freq=5 \
-    trainer.total_epochs=20 \
-    trainer.val_before_train=True \
+    trainer.save_freq=50 \
+    trainer.test_freq=-1 \
+    trainer.total_epochs=10 \
+    trainer.val_before_train=False \
     "${@:2}"
