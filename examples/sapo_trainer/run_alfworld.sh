@@ -12,6 +12,8 @@ arq_q_loss_mode=${ARQ_Q_LOSS_MODE:-absolute}
 arq_advantage_mode=${ARQ_ADVANTAGE_MODE:-gae}
 arq_q_advantage_mix_coef=${ARQ_Q_ADVANTAGE_MIX_COEF:-0.0}
 arq_q_lambda=${ARQ_Q_LAMBDA:-null}
+gradient_diagnostics_enable=${GRADIENT_DIAGNOSTICS_ENABLE:-false}
+gradient_diagnostics_interval=${GRADIENT_DIAGNOSTICS_INTERVAL:-25}
 
 arq_positive_token=${ARQ_POSITIVE_TOKEN:-'<|vision_start|>'}
 arq_negative_token=${ARQ_NEGATIVE_TOKEN:-'<|vision_end|>'}
@@ -67,6 +69,12 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.kl_loss_coef=0.01 \
     actor_rollout_ref.actor.kl_loss_type=low_var_kl \
     actor_rollout_ref.actor.grad_clip=1.0 \
+    actor_rollout_ref.actor.gradient_diagnostics.enable="$gradient_diagnostics_enable" \
+    actor_rollout_ref.actor.gradient_diagnostics.interval="$gradient_diagnostics_interval" \
+    actor_rollout_ref.actor.gradient_diagnostics.start_step=1 \
+    actor_rollout_ref.actor.gradient_diagnostics.max_micro_batches_per_update=1 \
+    actor_rollout_ref.actor.gradient_diagnostics.report_parameter_groups=True \
+    actor_rollout_ref.actor.gradient_diagnostics.offload_gradient_snapshots=True \
     actor_rollout_ref.actor.fsdp_config.param_offload=False \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=False \
     actor_rollout_ref.actor.use_invalid_action_penalty=True \

@@ -71,6 +71,25 @@ actor_rollout_ref:
     ulysses_sequence_parallel_size: 1 # sp size
     policy_loss:
       loss_mode: "vanilla"
+    # Reviewer-facing diagnostics for shared policy/V/Q parameter competition.
+    # Disabled by default because one sampled micro-batch requires two or three
+    # extra FSDP forward/backward passes. Enable for designated diagnostic runs.
+    gradient_diagnostics:
+      enable: False
+      start_step: 1
+      interval: 25
+      # Only one diagnostic micro-batch per actor update is currently supported.
+      max_micro_batches_per_update: 1
+      report_parameter_groups: True
+      # Keep gradient snapshots on CPU to minimize accelerator memory.
+      offload_gradient_snapshots: True
+      # Optional regex filters over FSDP/original parameter names. Empty lists
+      # select all trainable parameter shards.
+      include_patterns: []
+      exclude_patterns: []
+      # Fail the run if diagnostics cannot be computed. Set false only for
+      # exploratory jobs where missing measurements are acceptable.
+      strict: True
     # Conventional PPO value head sharing the causal-LM backbone. By default
     # the head predicts raw return values; scaled mode is an optional ablation.
     shared_value:

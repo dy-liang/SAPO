@@ -11,6 +11,8 @@ MODEL_PATH=${MODEL_PATH:-Qwen/Qwen2.5-7B-Instruct}
 TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE:-128}
 VAL_BATCH_SIZE=${VAL_BATCH_SIZE:-1}
 N_GPUS=${N_GPUS:-2}
+gradient_diagnostics_enable=${GRADIENT_DIAGNOSTICS_ENABLE:-false}
+gradient_diagnostics_interval=${GRADIENT_DIAGNOSTICS_INTERVAL:-25}
 ARQ_POSITIVE_TOKEN=${ARQ_POSITIVE_TOKEN:-'<|vision_start|>'}
 ARQ_NEGATIVE_TOKEN=${ARQ_NEGATIVE_TOKEN:-'<|vision_end|>'}
 
@@ -47,6 +49,12 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.model.use_remove_padding=True \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
     actor_rollout_ref.actor.optim.lr=1e-6 \
+    actor_rollout_ref.actor.gradient_diagnostics.enable="$gradient_diagnostics_enable" \
+    actor_rollout_ref.actor.gradient_diagnostics.interval="$gradient_diagnostics_interval" \
+    actor_rollout_ref.actor.gradient_diagnostics.start_step=1 \
+    actor_rollout_ref.actor.gradient_diagnostics.max_micro_batches_per_update=1 \
+    actor_rollout_ref.actor.gradient_diagnostics.report_parameter_groups=True \
+    actor_rollout_ref.actor.gradient_diagnostics.offload_gradient_snapshots=True \
     actor_rollout_ref.actor.ppo_mini_batch_size=4 \
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=2 \
     actor_rollout_ref.actor.ppo_epochs=2 \

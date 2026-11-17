@@ -21,6 +21,7 @@ import itertools
 import time
 import logging
 import os
+from contextlib import contextmanager
 from typing import Tuple
 
 import torch
@@ -53,6 +54,10 @@ from verl.utils.seqlen_balancing import get_reverse_idx, rearrange_micro_batches
 from verl.utils.torch_functional import logprobs_from_logits
 from verl.utils.ulysses import gather_outpus_and_unpad, ulysses_pad_and_slice_inputs, ulysses_pad
 from verl.workers.actor import BasePPOActor
+from verl.workers.actor.gradient_diagnostics import (
+    SharedGradientDiagnosticAccumulator,
+    select_named_trainable_parameters,
+)
 from transformers import PreTrainedTokenizer
 if is_cuda_available:
     from flash_attn.bert_padding import index_first_axis, pad_input, rearrange, unpad_input
@@ -131,6 +136,14 @@ class DataParallelPPOActor(BasePPOActor):
         )
         if self.arq_enabled and self.shared_value_enabled:
             raise ValueError("ARQ and SharedHead-PPO value branches are mutually exclusive")
+        self.gradient_diagnostics_config = self.config.get("gradient_diagnostics", None)
+        self.gradient_diagnostics_enabled = bool(
+            self.gradient_diagnostics_config is not None
+            and self.gradient_diagnostics_config.get("enable", False)
+        )
+        if self.gradient_diagnostics_enabled and not self.arq_enabled:
+            raise ValueError("Gradient diagnostics currently require ARQ/SAPO training")
+        self._gradient_diagnostic_parameters = None
         self.arq_token_ids = ()
         self.arq_lm_head = None
         self.shared_value_head = None
@@ -162,6 +175,221 @@ class DataParallelPPOActor(BasePPOActor):
                 self.shared_value_head = getattr(actor_root, "value_head", None)
                 if self.shared_value_head is None:
                     raise ValueError("SharedHead-PPO actor is missing value_head")
+
+    def _get_gradient_diagnostic_parameters(self):
+        """Cache the trainable FSDP flat parameters used by diagnostics."""
+        if self._gradient_diagnostic_parameters is None:
+            include_patterns = tuple(
+                self.gradient_diagnostics_config.get("include_patterns", [])
+            )
+            exclude_patterns = tuple(
+                self.gradient_diagnostics_config.get("exclude_patterns", [])
+            )
+            self._gradient_diagnostic_parameters = select_named_trainable_parameters(
+                self.actor_module.named_parameters(),
+                include_patterns=include_patterns,
+                exclude_patterns=exclude_patterns,
+            )
+            if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+                logger.warning(
+                    "Gradient diagnostics selected %d FSDP/original parameter tensors",
+                    len(self._gradient_diagnostic_parameters),
+                )
+        return self._gradient_diagnostic_parameters
+
+    def _should_run_gradient_diagnostics(self, global_step: int) -> bool:
+        if not self.gradient_diagnostics_enabled:
+            return False
+        interval = int(self.gradient_diagnostics_config.get("interval", 25))
+        start_step = int(self.gradient_diagnostics_config.get("start_step", 1))
+        if interval <= 0:
+            raise ValueError("gradient_diagnostics.interval must be positive")
+        return global_step >= start_step and (global_step - start_step) % interval == 0
+
+    @contextmanager
+    def _preserve_gradient_diagnostic_rng(self):
+        """Keep diagnostic forwards from perturbing the real training RNG stream."""
+        cpu_rng_state = torch.get_rng_state()
+        device_rng_state = None
+        if self.device_name != "cpu":
+            device_rng_state = get_torch_device().get_rng_state()
+        try:
+            yield
+        finally:
+            torch.set_rng_state(cpu_rng_state)
+            if device_rng_state is not None:
+                get_torch_device().set_rng_state(device_rng_state)
+
+    def _compute_arq_gradient_diagnostic_losses(
+        self,
+        *,
+        data,
+        temperature,
+        response_mask,
+        arq_sample_mask,
+    ):
+        """Recompute unweighted actor, V, and Q losses for one diagnostic batch."""
+        entropy_coeff = self.config.entropy_coeff
+        entropy, log_prob, _, arq_outputs = self._forward_micro_batch(
+            micro_batch=data,
+            temperature=temperature,
+            calculate_entropy=entropy_coeff != 0,
+            calculate_nov=False,
+            calculate_arq=True,
+            calculate_shared_value=False,
+        )
+        if arq_outputs is None:
+            raise RuntimeError("ARQ gradient diagnostics require current V/Q outputs")
+
+        loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
+        if loss_mode == "vanilla":
+            policy_loss_fn = compute_policy_loss
+        elif loss_mode == "gspo":
+            policy_loss_fn = compute_policy_loss_gspo
+        else:
+            raise ValueError(f"Unsupported loss_mode: {loss_mode}")
+
+        clip_ratio = self.config.clip_ratio
+        clip_ratio_low = (
+            self.config.clip_ratio_low
+            if self.config.clip_ratio_low is not None
+            else clip_ratio
+        )
+        clip_ratio_high = (
+            self.config.clip_ratio_high
+            if self.config.clip_ratio_high is not None
+            else clip_ratio
+        )
+        pg_loss, _, _, _ = policy_loss_fn(
+            old_log_prob=data["old_log_probs"],
+            log_prob=log_prob,
+            advantages=data["advantages"],
+            response_mask=response_mask,
+            cliprange=clip_ratio,
+            cliprange_low=clip_ratio_low,
+            cliprange_high=clip_ratio_high,
+            clip_ratio_c=self.config.get("clip_ratio_c", 3.0),
+            loss_agg_mode=self.config.loss_agg_mode,
+        )
+        actor_objective = pg_loss
+        if entropy_coeff != 0:
+            entropy_loss = agg_loss(
+                loss_mat=entropy,
+                loss_mask=response_mask,
+                loss_agg_mode=self.config.loss_agg_mode,
+            )
+            actor_objective = actor_objective - entropy_loss * entropy_coeff
+        if self.config.use_kl_loss:
+            kld = kl_penalty(
+                logprob=log_prob,
+                ref_logprob=data["ref_log_prob"],
+                kl_penalty=self.config.kl_loss_type,
+            )
+            kl_loss = agg_loss(
+                loss_mat=kld,
+                loss_mask=response_mask,
+                loss_agg_mode=self.config.loss_agg_mode,
+            )
+            actor_objective = actor_objective + kl_loss * self.config.kl_loss_coef
+
+        value_loss, _ = compute_arq_value_loss(
+            current_probs=arq_outputs["v_probs"],
+            old_probs=data["old_v_probs"],
+            target_probs=data["arq_v_target_probs"],
+            cliprange=float(self.arq_config.value_cliprange),
+            sample_mask=arq_sample_mask,
+        )
+        q_loss = None
+        if float(self.arq_config.q_loss_coef) > 0.0:
+            q_loss, _ = compute_arq_q_loss(
+                current_q_probs=arq_outputs["q_probs"],
+                current_v_probs=arq_outputs["v_probs"],
+                old_q_probs=data["old_q_probs"],
+                old_v_probs=data["old_v_probs"],
+                q_target_probs=data["arq_q_target_probs"],
+                q_advantage_target_probs=(
+                    data["arq_q_target_probs"] - data["old_v_probs"]
+                ),
+                cliprange=float(self.arq_config.q_cliprange),
+                loss_mode=str(self.arq_config.get("q_loss_mode", "absolute")),
+                sample_mask=arq_sample_mask,
+            )
+        return actor_objective, value_loss, q_loss
+
+    def _run_arq_gradient_diagnostics(
+        self,
+        *,
+        data,
+        temperature,
+        response_mask,
+        arq_sample_mask,
+    ):
+        """Measure component gradients without changing the optimizer update."""
+        accumulator = SharedGradientDiagnosticAccumulator(
+            self._get_gradient_diagnostic_parameters(),
+            report_parameter_groups=bool(
+                self.gradient_diagnostics_config.get(
+                    "report_parameter_groups", True
+                )
+            ),
+            offload_gradient_snapshots=bool(
+                self.gradient_diagnostics_config.get(
+                    "offload_gradient_snapshots", True
+                )
+            ),
+            reduction_device=(
+                torch.device("cpu")
+                if self.device_name == "cpu"
+                else torch.device(
+                    self.device_name, get_torch_device().current_device()
+                )
+            ),
+        )
+        q_active = float(self.arq_config.q_loss_coef) > 0.0
+        components = ["policy", "value"]
+        if q_active:
+            components.append("q")
+
+        try:
+            for component in components:
+                self.actor_optimizer.zero_grad()
+                # Each context starts from and restores the same RNG state, so
+                # the three component passes share dropout masks and the real
+                # training forward observes an untouched RNG stream.
+                with self._preserve_gradient_diagnostic_rng():
+                    actor_objective, value_loss, q_loss = (
+                        self._compute_arq_gradient_diagnostic_losses(
+                            data=data,
+                            temperature=temperature,
+                            response_mask=response_mask,
+                            arq_sample_mask=arq_sample_mask,
+                        )
+                    )
+                    component_loss = {
+                        "policy": actor_objective,
+                        "value": value_loss,
+                        "q": q_loss,
+                    }[component]
+                    if component_loss is None:
+                        raise RuntimeError(
+                            f"Missing loss for gradient diagnostic component {component}"
+                        )
+                    component_loss.backward()
+
+                if component == "policy":
+                    accumulator.capture_policy_gradient()
+                else:
+                    accumulator.accumulate_auxiliary_gradient(component)
+        finally:
+            # This is the invariant that prevents diagnostic gradients from
+            # leaking into the actual joint PPO+V+Q optimizer update.
+            self.actor_optimizer.zero_grad()
+
+        return accumulator.finalize(
+            value_weight=float(self.arq_config.value_loss_coef),
+            q_weight=float(self.arq_config.q_loss_coef),
+            q_active=q_active,
+        )
 
     def _get_arq_boundary_positions(self, attention_mask, response_length, unpad_indices=None):
         """Return padded or compact [B, V/Q] LM-head input positions."""
@@ -628,6 +856,22 @@ class DataParallelPPOActor(BasePPOActor):
 
         temperature = data.meta_info["temperature"]  # temperature must be in the data.meta_info to avoid silent error
         multi_turn = data.meta_info.get("multi_turn", False)
+        global_step = int(data.meta_info.get("global_step", -1))
+        run_gradient_diagnostics = self._should_run_gradient_diagnostics(global_step)
+        gradient_diagnostic_micro_batches = 0
+        max_gradient_diagnostic_micro_batches = (
+            int(
+                self.gradient_diagnostics_config.get(
+                    "max_micro_batches_per_update", 1
+                )
+            )
+            if self.gradient_diagnostics_enabled
+            else 0
+        )
+        if run_gradient_diagnostics and max_gradient_diagnostic_micro_batches != 1:
+            raise ValueError(
+                "gradient_diagnostics.max_micro_batches_per_update currently must be 1"
+            )
 
         select_keys = ["responses", "input_ids", "attention_mask", "position_ids", "old_log_probs", "advantages"]
         use_ppo_turn_policy_mask = "ppo_turn_policy_mask" in data.batch
@@ -735,6 +979,37 @@ class DataParallelPPOActor(BasePPOActor):
                     calculate_entropy = False
                     if entropy_coeff != 0:
                         calculate_entropy = True
+
+                    if (
+                        self.arq_enabled
+                        and run_gradient_diagnostics
+                        and gradient_diagnostic_micro_batches
+                        < max_gradient_diagnostic_micro_batches
+                    ):
+                        # Count the attempt before running it. If strict=false
+                        # and diagnostics fail, retrying after a real micro-
+                        # batch backward would clear accumulated train grads.
+                        gradient_diagnostic_micro_batches += 1
+                        try:
+                            diagnostic_metrics = self._run_arq_gradient_diagnostics(
+                                data=data,
+                                temperature=temperature,
+                                response_mask=response_mask,
+                                arq_sample_mask=arq_sample_mask,
+                            )
+                        except RuntimeError:
+                            if bool(
+                                self.gradient_diagnostics_config.get("strict", True)
+                            ):
+                                raise
+                            logger.exception(
+                                "Gradient diagnostics failed at global step %d; "
+                                "continuing because strict=false",
+                                global_step,
+                            )
+                        else:
+                            append_to_dict(metrics, diagnostic_metrics)
+
                     forward_outputs = self._forward_micro_batch(
                             micro_batch=data,
                             temperature=temperature,

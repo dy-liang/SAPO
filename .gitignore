@@ -9,6 +9,7 @@
 **/playground
 **/wandb
 test_*
+!tests/workers/actor/test_gradient_diagnostics.py
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
